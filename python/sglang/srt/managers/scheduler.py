@@ -154,7 +154,7 @@ from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
@@ -933,7 +933,7 @@ class Scheduler(
             self.disagg_prefill_inflight_queue: List[Req] = []
 
     def init_overlap(self):
-        if not self.enable_overlap:
+        if not self.enable_overlap and self.pp_size == 1:
             return
 
         self.forward_stream: CudaStream = torch.get_device_module(self.device).Stream()
@@ -944,6 +944,9 @@ class Scheduler(
         self.copy_stream_ctx: CudaStreamContext = torch.get_device_module(
             self.device
         ).stream(self.copy_stream)
+
+        if not self.enable_overlap:
+            return
 
         self.future_map = FutureMap(
             self.max_running_requests, self.device, self.spec_algorithm
@@ -1953,7 +1956,8 @@ class Scheduler(
         pass
 
     def run_batch(
-        self, batch: ScheduleBatch
+        self, batch: ScheduleBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
         self.forward_ct += 1
@@ -2036,8 +2040,13 @@ class Scheduler(
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 future_indices_or_next_token_ids = batch_result.next_token_ids
             else:
+                kwargs = (
+                    {"pp_proxy_tensors": pp_proxy_tensors}
+                    if self.spec_algorithm.is_none()
+                    else {}
+                )
                 batch_result = self.model_worker.forward_batch_generation(
-                    batch_or_worker_batch
+                    batch_or_worker_batch, **kwargs
                 )
                 future_indices_or_next_token_ids = batch_result.next_token_ids
                 self.update_cache_from_scheduler(batch, batch_result)

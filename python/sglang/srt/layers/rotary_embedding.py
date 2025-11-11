@@ -167,18 +167,17 @@ class RotaryEmbedding(CustomOp):
         cache = torch.cat((cos, sin), dim=-1)
         return cache
 
-    def get_cos_sin_with_position(self, positions, layer_id):
-        if layer_id == 0:
-            cos_sin = self.cos_sin_cache.index_select(0, positions)
-            last_dim = cos_sin.size()[-1]
-            cos, sin = (
-                cos_sin.reshape(-1, 2, last_dim // 2).repeat(1, 1, 2).chunk(2, dim=-2)
-            )
-            # BSNH
-            self.position_cos, self.position_sin = (
-                cos.view(-1, 1, 1, last_dim).contiguous(),
-                sin.view(-1, 1, 1, last_dim).contiguous(),
-            )
+    def get_cos_sin_with_position(self, positions):
+        cos_sin = self.cos_sin_cache.index_select(0, positions)
+        last_dim = cos_sin.size()[-1]
+        cos, sin = (
+            cos_sin.reshape(-1, 2, last_dim // 2).repeat(1, 1, 2).chunk(2, dim=-2)
+        )
+        # BSNH
+        self.position_cos, self.position_sin = (
+            cos.view(-1, 1, 1, last_dim).contiguous(),
+            sin.view(-1, 1, 1, last_dim).contiguous(),
+        )
 
     def forward_native(
         self,
@@ -187,6 +186,7 @@ class RotaryEmbedding(CustomOp):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
+        layer_id: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """A PyTorch-native implementation of forward()."""
         assert (
@@ -224,6 +224,7 @@ class RotaryEmbedding(CustomOp):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
+        layer_id: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """A PyTorch-npu implementation of forward()."""
         assert (
@@ -234,6 +235,14 @@ class RotaryEmbedding(CustomOp):
             return self.forward_native(
                 positions, query, key, offsets, fused_set_kv_buffer_arg
             )
+        elif self.head_size == 128 and layer_id is not None:
+            self.get_cos_sin_with_position(positions, layer_id)
+            query = query.contiguous().view(query.shape[0], 1, -1, self.head_size)
+            key = key.contiguous().view(key.shape[0], 1, -1, self.head_size)
+            torch_npu.npu_apply_rotary_pos_emb(
+                query, key, self.position_cos, self.position_sin
+            )
+            return query, key
         else:
             rotary_mode = "half"
             if self.is_neox_style:
@@ -259,6 +268,7 @@ class RotaryEmbedding(CustomOp):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
+        layer_id: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert (
             fused_set_kv_buffer_arg is None

@@ -50,22 +50,23 @@ class AscendTransferEngine(MooncakeTransferEngine):
             get_tensor_model_parallel_world_size,
             get_tp_group,
         )
+        from sglang.srt.distributed.parallel_state import get_world_size, get_world_group
 
         transfer_protocol = self._get_transfer_protocol()
         if transfer_protocol is None or transfer_protocol == "sdma":
             trans_op_type = TransferEngine.TransDataOpType.SDMA
         else:
             trans_op_type = TransferEngine.TransDataOpType.DEVICE_RDMA
-            """with device RDMA for PD transfer"""
-            tmp_tensor = torch.zeros(1, device="npu")
-            output_tensor_list = [
-                torch.empty_like(tmp_tensor)
-                for _ in range(get_tensor_model_parallel_world_size())
-            ]
-            # Initialize hccl in advance through all_gather to avoid conflicts with rdma initialization.
-            torch.distributed.all_gather(
-                output_tensor_list, tmp_tensor, group=get_tp_group().device_group
-            )
+        """with device RDMA for PD transfer"""
+        tmp_tensor = torch.zeros(1, device="npu")
+        output_tensor_list = [
+            torch.empty_like(tmp_tensor)
+            for _ in range(get_world_size())
+        ]
+        # Initialize hccl in advance through all_gather to avoid conflicts with rdma initialization.
+        torch.distributed.all_gather(
+            output_tensor_list, tmp_tensor, group=get_world_group().device_group
+        )
         """Initialize the ascend transfer instance."""
         ret_value = self.engine.initialize(
             self.store_url, self.session_id, self.role, self.npu_id, trans_op_type

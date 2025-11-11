@@ -400,9 +400,11 @@ class Qwen3MoeAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        start_layer: int,
     ):
         qkv, _ = self.qkv_proj(hidden_states)
-        self.rotary_emb.get_cos_sin_with_position(positions, layer_id=self.attn.layer_id)
+        if start_layer == self.attn.layer_id:
+            self.rotary_emb.get_cos_sin_with_position(positions)
         q, k, v = split_qkv_rmsnorm_rope(
             qkv,
             self.rotary_emb.position_sin,
@@ -451,6 +453,7 @@ class Qwen3MoeAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        start_layer: int,
     ):
         if hidden_states.shape[0] == 0:
             return hidden_states, forward_batch, None
@@ -465,6 +468,7 @@ class Qwen3MoeAttention(nn.Module):
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
+                start_layer=start_layer,
             )
 
     def forward_core(self, intermediate_state):
@@ -486,11 +490,13 @@ class Qwen3MoeAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        start_layer: int,
     ) -> torch.Tensor:
         s = self.forward_prepare(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
+            start_layer=start_layer,
         )
         return self.forward_core(s)
 
@@ -586,6 +592,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
         captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
+        start_layer: Optional[int] = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
         hidden_states, residual = (
@@ -602,6 +609,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
+                start_layer=start_layer,
             )
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(

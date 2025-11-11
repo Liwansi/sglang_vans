@@ -613,6 +613,7 @@ class Qwen2MoeModel(nn.Module):
                             if getattr(layer, "_is_layer_to_capture", False)
                             else None
                         ),
+                        start_layer=self.start_layer,
                     )
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(

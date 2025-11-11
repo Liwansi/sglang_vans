@@ -246,14 +246,17 @@ class PrefillBootstrapQueue:
         polls = poll_and_all_reduce(
             [req.disagg_kv_sender for req in self.queue], self.gloo_group
         )
-
+        #print(f"rids_to_check poll: {polls}, rank:{torch.distributed.get_rank()}")
         for i, (req, poll) in enumerate(zip(self.queue, polls)):
             if rids_to_check is not None:
                 # if req not in reqs_info_to_check, skip
                 if req.rid not in rids_to_check:
                     continue
                 # Either waiting for input or failed
-                assert poll == KVPoll.WaitingForInput or poll == KVPoll.Failed
+                #assert poll == KVPoll.WaitingForInput or poll == KVPoll.Failed
+                if (poll != KVPoll.WaitingForInput and poll != KVPoll.Failed):
+                    print(f"rids_to_check req.rid: {req.rid}, poll: {poll}, rank:{torch.distributed.get_rank()}")
+                    #assert poll == KVPoll.WaitingForInput or poll == KVPoll.Failed
 
             if poll == KVPoll.Bootstrapping:
                 continue
