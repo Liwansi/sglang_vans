@@ -253,10 +253,10 @@ class PrefillBootstrapQueue:
                 if req.rid not in rids_to_check:
                     continue
                 # Either waiting for input or failed
-                #assert poll == KVPoll.WaitingForInput or poll == KVPoll.Failed
-                if (poll != KVPoll.WaitingForInput and poll != KVPoll.Failed):
-                    print(f"rids_to_check req.rid: {req.rid}, poll: {poll}, rank:{torch.distributed.get_rank()}")
-                    #assert poll == KVPoll.WaitingForInput or poll == KVPoll.Failed
+                assert poll == KVPoll.WaitingForInput or poll == KVPoll.Failed
+                # if (poll != KVPoll.WaitingForInput and poll != KVPoll.Failed):
+                #     print(f"rids_to_check req.rid: {req.rid}, poll: {poll}, rank:{torch.distributed.get_rank()}")
+                #     #assert poll == KVPoll.WaitingForInput or poll == KVPoll.Failed
 
             if poll == KVPoll.Bootstrapping:
                 continue
@@ -438,6 +438,7 @@ class SchedulerDisaggregationPrefillMixin:
                 req.add_latency(RequestStage.PREFILL_FORWARD)
                 trace_slice(RequestStage.PREFILL_FORWARD, req.rid, auto_next_anon=True)
                 self.disagg_prefill_inflight_queue.append(req)
+                print(f"self.disagg_prefill_inflight_queue len : {len(self.disagg_prefill_inflight_queue)}")
                 if self.spec_algorithm.is_eagle() and batch.spec_info is not None:
                     req.output_topk_p = batch.spec_info.topk_p[i]
                     req.output_topk_index = batch.spec_info.topk_index[i]

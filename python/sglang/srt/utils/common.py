@@ -1260,6 +1260,7 @@ def point_to_point_pyobj(
     else:
         send_func = dist.send
     if rank == src:
+        #print("**************** send *********************")
         p2p_works = []
         if len(data) == 0:
             tensor_size = torch.tensor(
@@ -1273,11 +1274,7 @@ def point_to_point_pyobj(
         else:
             serialized_data = pickle.dumps(data)
             size = len(serialized_data)
-            tensor_data = torch.ByteTensor(
-                np.frombuffer(serialized_data, dtype=np.uint8)
-            ).to(
-                device=device
-            )
+            tensor_data = torch.frombuffer(serialized_data, dtype=torch.uint8).to(device)
             tensor_size = torch.tensor([size], dtype=torch.long, device=device)
 
             work = send_func(tensor_size, dst, group=group)
@@ -1289,13 +1286,9 @@ def point_to_point_pyobj(
         return p2p_works
 
     elif rank == dst:
-        tensor_size = torch.tensor(
-            [0],
-            dtype=torch.long,
-            device=device
-        )
-        work = dist.irecv(tensor_size, src=src, group=group)
-        work.wait()
+        #print("**************** recv *********************")
+        tensor_size = torch.empty([], dtype=torch.long, device=device)
+        dist.recv(tensor_size, src=src, group=group)
         size = tensor_size.item()
 
         if size == 0:
@@ -1306,10 +1299,9 @@ def point_to_point_pyobj(
             dtype=torch.uint8,
             device=device
         )
-        work = dist.irecv(tensor_data, src=src, group=group)
-        work.wait()
+        dist.recv(tensor_data, src=src, group=group)
 
-        serialized_data = bytes(tensor_data.cpu().numpy())
+        serialized_data = tensor_data.cpu().numpy().tobytes()
         data = pickle.loads(serialized_data)
         return data
 

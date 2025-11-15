@@ -510,6 +510,14 @@ class SchedulerPPMixin:
         send_proxy_work = []
         send_release_work = []
         send_transfer_work = []
+        send_output_work = []
+
+        recv_req_work = []
+        recv_bootstrapped_work = []
+        recv_proxy_work = []
+        recvrelease_work = []
+        recv_transfer_work = []
+        recv_output_work = []
 
         import os
         import torch
@@ -541,10 +549,11 @@ class SchedulerPPMixin:
                 experimental_config=experimental_config)
 
         prof_bs = 2
-
+        import torch.distributed as dist
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
+                #print(f"**************** mb_id: {mb_id}", flush=True)
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.pp_size) % self.pp_loop_size
@@ -557,27 +566,18 @@ class SchedulerPPMixin:
                 next_batch_result = None
 
                 recv_reqs = self.recv_requests()
-                self._pp_commit_comm_work(send_req_work)
+                # self._pp_commit_comm_work(send_req_work)
                 self.process_input_requests(recv_reqs)
 
                 bootstrapped_rids = self._pp_pd_get_bootstrapped_ids()
+                print(f"bootstrapped_rids: {bootstrapped_rids}")
                 bmbs[mb_id] = bootstrapped_rids
-                self._pp_commit_comm_work(send_bootstrapped_work)
+                # self._pp_commit_comm_work(send_bootstrapped_work)
 
                 transferred_rids = self._pp_pd_get_transferred_ids()
-                self._pp_commit_comm_work(send_transfer_work)
+                print(f"transferred_rids: {transferred_rids}")
+                # self._pp_commit_comm_work(send_transfer_work)
                 tmbs[mb_id] = transferred_rids
-
-                if not self.pp_group.is_last_rank:
-                    send_req_work = self._pp_send_pyobj_to_next_stage(
-                        recv_reqs, async_send=True
-                    )
-                    send_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
-                        bootstrapped_rids, async_send=True
-                    )
-                    send_transfer_work = self._pp_send_pyobj_to_next_stage(
-                        transferred_rids, async_send=True
-                    )
 
                 self.process_prefill_chunk()
 
@@ -592,9 +592,9 @@ class SchedulerPPMixin:
                 if self.cur_batch:
                     server_is_idle = False
                     pp_proxy_tensors = self._pp_recv_proxy_tensors()
-                self._pp_commit_comm_work(send_proxy_work)
+                # self._pp_commit_comm_work(send_proxy_work)
                 if self.server_args.pp_async_batch_depth > 0:
-                    next_pp_outputs, next_batch_result, d2h_event = (
+                    next_pp_outputs, next_batch_result, d2h_event, send_output_work = (
                         self._pp_send_recv_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
                             next_mb_id,
@@ -620,7 +620,8 @@ class SchedulerPPMixin:
                     if enable_profiling and prof_cnt > 0 and prof_cnt < 10:
                         prof.step()
                 if self.server_args.pp_async_batch_depth == 0:
-                    next_pp_outputs, next_batch_result, d2h_event, _ = (
+                    self._pp_commit_comm_work(work=send_output_work) # pp_outputs_to_send.tensors
+                    next_pp_outputs, next_batch_result, d2h_event, send_output_work = (
                         self._pp_send_recv_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
                             next_mb_id,
@@ -630,29 +631,31 @@ class SchedulerPPMixin:
                             pp_outputs,
                         )
                     )
-                send_consensus_bootstrapped_work, consensus_bootstrapped_rids = (
-                    self._pp_pd_send_consensus_bootstrapped_ids(
-                        bmbs,
-                        next_first_rank_mb_id,
-                        consensus_bootstrapped_rids,
-                        bootstrapped_rids,
-                    )
-                )
+                # self._pp_commit_comm_work(send_consensus_bootstrapped_work) # consensus_bootstrapped_rids
+                # send_consensus_bootstrapped_work, consensus_bootstrapped_rids = (
+                #     self._pp_pd_send_consensus_bootstrapped_ids(
+                #         bmbs,
+                #         next_first_rank_mb_id,
+                #         consensus_bootstrapped_rids,
+                #         bootstrapped_rids,
+                #     )
+                # )
+                self._pp_commit_comm_work(send_release_work)# release_rids
                 send_release_work, release_rids = (
                     self._pp_pd_send_consensus_release_ids(
                         tmbs, next_first_rank_mb_id, release_rids, transferred_rids
                     )
                 )
 
-                if bmbs[next_mb_id] is not None:
-                    next_consensus_bootstrapped_rids = self.recv_pyobj_from_prev_stage()
-                    next_consensus_bootstrapped_rids = self.process_bootstrapped_queue(
-                        next_consensus_bootstrapped_rids
-                    )
-                self._pp_commit_comm_work(send_consensus_bootstrapped_work)
+                # if bmbs[next_mb_id] is not None:
+                #     next_consensus_bootstrapped_rids = self.recv_pyobj_from_prev_stage()
+                #     next_consensus_bootstrapped_rids = self.process_bootstrapped_queue(
+                #         next_consensus_bootstrapped_rids
+                #     )
+                # self._pp_commit_comm_work(send_consensus_bootstrapped_work)
                 if tmbs[next_mb_id] is not None:
                     next_release_rids = self.recv_pyobj_from_prev_stage()
-                self._pp_commit_comm_work(send_release_work)
+                # self._pp_commit_comm_work(send_release_work)
                 # post-process the coming microbatch
                 if mbs[next_mb_id] is not None:
                     d2h_event.synchronize()
@@ -665,17 +668,21 @@ class SchedulerPPMixin:
                 if tmbs[next_mb_id] is not None:
                     self.process_disagg_prefill_inflight_queue(next_release_rids)
                 if not self.pp_group.is_last_rank:
-                    # send_req_work = self._pp_send_pyobj_to_next_stage(
-                    #     recv_reqs, async_send=True
-                    # )
-                    # send_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
-                    #     bootstrapped_rids, async_send=True
-                    # )
-                    # send_transfer_work = self._pp_send_pyobj_to_next_stage(
-                    #     transferred_rids, async_send=True
-                    # )
+                    self._pp_commit_comm_work(send_req_work) #recv_reqs
+                    send_req_work = self._pp_send_pyobj_to_next_stage(
+                        recv_reqs, async_send=True
+                    )
+                    self._pp_commit_comm_work(send_bootstrapped_work) # bootstrapped_rids
+                    send_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
+                        bootstrapped_rids, async_send=True
+                    )
+                    self._pp_commit_comm_work(send_transfer_work)# transferred_rids
+                    send_transfer_work = self._pp_send_pyobj_to_next_stage(
+                        transferred_rids, async_send=True
+                    )
                     if self.cur_batch:
                         torch.get_device_module(self.device).current_stream().wait_event(event)
+                        self._pp_commit_comm_work(send_proxy_work) # hidden_states
                         send_proxy_work = self._pp_send_dict_to_next_stage(
                             result.pp_hidden_states_proxy_tensors.tensors,
                             async_send=True,
@@ -687,9 +694,10 @@ class SchedulerPPMixin:
 
                 pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
-                consensus_bootstrapped_rids = next_consensus_bootstrapped_rids
+                #consensus_bootstrapped_rids = next_consensus_bootstrapped_rids
 
                 self.running_batch.batch_is_full = False
+                print(f"**************** mb_id: {mb_id} loop finish, rank: {dist.get_rank()}", flush=True)
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle and len(self.disagg_prefill_inflight_queue) == 0:
