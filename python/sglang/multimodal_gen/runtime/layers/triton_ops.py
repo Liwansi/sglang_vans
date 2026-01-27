@@ -10,6 +10,8 @@ from torch import Tensor
 
 from sglang.multimodal_gen.runtime.utils.common import is_npu
 
+from sgl_kernel_npu.utils.triton_utils import get_device_properties
+
 _is_npu = is_npu()
 
 
@@ -318,11 +320,68 @@ def _rotary_embedding_kernel(
         tl.store(output_row_ptr + offsets_x2, o2_vals.to(x2_vals.dtype), mask=mask)
 
 
+@triton.jit
+def _rotary_embedding_npu_kernel(
+    output_ptr,
+    x_ptr,
+    cos_ptr,
+    sin_ptr,
+    num_heads: tl.constexpr,
+    head_size: tl.constexpr,
+    num_tokens: tl.constexpr,
+    stride_x_row,
+    stride_cos_row,
+    stride_sin_row,
+    task_num: tl.constexpr,
+    interleaved: tl.constexpr,
+    BLOCK_HS_HALF: tl.constexpr = 64,
+):
+    row_idx = tl.program_id(0)
+    core_num = tl.num_programs(0)
+    for task_i in range(row_idx, task_num, core_num):
+        token_idx = task_i
+        # num_heads to NUM_HEADS
+        x_row_ptr = x_ptr + token_idx * stride_x_row + tl.arange(0, num_heads)[:, None] * head_size  # head * head_size
+        mask_m = tl.arange(0, num_heads) < num_heads
+        cos_row_ptr = cos_ptr + token_idx * stride_cos_row
+        sin_row_ptr = sin_ptr + token_idx * stride_sin_row
+        output_row_ptr = output_ptr + token_idx * stride_x_row + tl.arange(0, num_heads)[:, None] * head_size
+
+        # half size for x1 and x2
+        head_size_half: tl.constexpr = head_size // 2
+
+        for block_start in range(0, head_size_half, BLOCK_HS_HALF):
+            offsets_half = block_start + tl.arange(0, BLOCK_HS_HALF)
+            mask_n = offsets_half < head_size_half
+
+            cos_vals = tl.load(cos_row_ptr + offsets_half, mask=mask_n, other=0.0)
+            sin_vals = tl.load(sin_row_ptr + offsets_half, mask=mask_n, other=0.0)
+
+            offsets_x1 = 2 * offsets_half
+            offsets_x2 = 2 * offsets_half + 1
+            # 核内一次做全部head, 一次加载
+            x1_vals = tl.load(x_row_ptr + offsets_x1[None, :], mask=mask_m[:, None] & mask_n[None, :], other=0.0)
+            x2_vals = tl.load(x_row_ptr + offsets_x2[None, :], mask=mask_m[:, None] & mask_n[None, :], other=0.0)
+
+            x1_fp32 = x1_vals.to(tl.float32)
+            x2_fp32 = x2_vals.to(tl.float32)
+            cos_fp32 = cos_vals.to(tl.float32).reshape(1, BLOCK_HS_HALF).broadcast_to(num_heads, BLOCK_HS_HALF).to(
+                tl.float32)
+            sin_fp32 = sin_vals.to(tl.float32).reshape(1, BLOCK_HS_HALF).broadcast_to(num_heads, BLOCK_HS_HALF).to(
+                tl.float32)
+            o1_vals = tl.fma(-x2_fp32, sin_fp32, x1_fp32 * cos_fp32)
+            o2_vals = tl.fma(x1_fp32, sin_fp32, x2_fp32 * cos_fp32)
+
+            tl.store(output_row_ptr + offsets_x1[None, :], o1_vals.to(x1_vals.dtype),
+                     mask=mask_m[:, None] & mask_n[None, :])
+            tl.store(output_row_ptr + offsets_x2[None, :], o2_vals.to(x2_vals.dtype),
+                     mask=mask_m[:, None] & mask_n[None, :])
+
+
 def apply_rotary_embedding(
     x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, interleaved: bool = False
 ) -> torch.Tensor:
     output = torch.empty_like(x)
-
     if x.dim() > 3:
         bsz, num_tokens, num_heads, head_size = x.shape
     else:
@@ -331,12 +390,19 @@ def apply_rotary_embedding(
 
     assert head_size % 2 == 0, "head_size must be divisible by 2"
 
-    x_reshaped = x.view(-1, head_size)
-    output_reshaped = output.view(-1, head_size)
+    x_reshaped = x.view(-1, num_heads, head_size)
+    output_reshaped = output.view(-1, num_heads, head_size)
+
+    _, num_vectorcore = get_device_properties()
+    # print(f"{num_vectorcore=}, {bsz * num_tokens}") #48, 1024
+    actual_core_num = min(num_vectorcore, bsz * num_tokens)
 
     # num_tokens per head, 1 token per block
-    grid = (bsz * num_tokens * num_heads,)
-
+    grid = (actual_core_num,)
+    task_num = bsz * num_tokens
+    # print(f"==>apply_rotary_embedding x: {x.shape}, grid: {grid}")
+    #  x: torch.Size([1, 5080, 24, 128]), grid: (121920,)
+    # TRITON_ALL_BLOCKS_PARALLEL=1 ENABLE_UNPUBLISHED_FEATURE=1 The DDR address of the MTE instruction is out of range.
     if interleaved and cos.shape[-1] == head_size:
         cos = cos[..., ::2].contiguous()
         sin = sin[..., ::2].contiguous()
@@ -344,7 +410,7 @@ def apply_rotary_embedding(
         cos = cos.contiguous()
         sin = sin.contiguous()
 
-    _rotary_embedding_kernel[grid](
+    _rotary_embedding_npu_kernel[grid](
         output_reshaped,
         x_reshaped,
         cos,
@@ -355,27 +421,11 @@ def apply_rotary_embedding(
         x_reshaped.stride(0),
         cos.stride(0),
         sin.stride(0),
+        task_num,
         interleaved,
     )
 
     return output
-
-
-if _is_npu:
-    # TODO: remove this when triton ascend bug is fixed
-    def apply_rotary_embedding_native(
-        x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, interleaved: bool = False
-    ) -> torch.Tensor:
-        cos = cos.unsqueeze(-2).to(x.dtype)
-        sin = sin.unsqueeze(-2).to(x.dtype)
-        x1 = x[..., ::2]
-        x2 = x[..., 1::2]
-        o1 = x1 * cos - x2 * sin
-        o2 = x2 * cos + x1 * sin
-        return torch.stack((o1, o2), dim=-1).flatten(-2)
-
-    apply_rotary_embedding = apply_rotary_embedding_native
-
 
 # RMSNorm-fp32
 def maybe_contiguous_lastdim(x):

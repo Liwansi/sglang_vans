@@ -338,3 +338,14 @@ def get_bool_env_var(name: str, default: str = "false") -> bool:
         _warned_bool_env_var_keys.add(value)
 
     return value in truthy_values
+
+def is_npu() -> bool:
+    return hasattr(torch, "npu") and torch.npu.is_available()
+
+global _FIRST_DIT_STEP_TIMESTEP
+
+def set_first_dit_step_timestep(timestep: torch.LongTensor):
+    _FIRST_DIT_STEP_TIMESTEP = timestep
+
+def get_first_dit_step_timestep():
+    return _FIRST_DIT_STEP_TIMESTEP

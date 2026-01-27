@@ -362,8 +362,8 @@ class QwenImageCrossAttention(nn.Module):
         )
 
         # Reshape back
-        joint_hidden_states = joint_hidden_states.flatten(2, 3)
-        joint_hidden_states = joint_hidden_states.to(joint_query.dtype)
+        if joint_hidden_states.dtype != joint_query.dtype:
+            joint_hidden_states = joint_hidden_states.to(joint_query.dtype)
 
         # Split attention outputs back
         txt_attn_output = joint_hidden_states[:, :seq_len_txt, :]  # Text part

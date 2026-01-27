@@ -20,7 +20,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.pipelines_core import Req, build_pipeline
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
-from sglang.multimodal_gen.runtime.utils.common import is_cuda, set_cuda_arch
+from sglang.multimodal_gen.runtime.utils.common import is_cuda, set_cuda_arch, is_npu
 
 _is_cuda = is_cuda()
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
@@ -38,6 +38,8 @@ logger = init_logger(__name__)
 CYAN = "\033[1;36m"
 RESET = "\033[0;0m"
 
+if is_npu():
+    import torch_npu
 
 class GPUWorker:
     """
@@ -106,8 +108,21 @@ class GPUWorker:
             start_time = time.monotonic()
             timings = RequestTimings(request_id=req.request_id)
             req.timings = timings
-
-            output_batch = self.pipeline.forward(req, self.server_args)
+            if False:
+                experimental_config = torch_npu.profiler._ExperimentalConfig(
+                    profiler_level=torch_npu.profiler.ProfilerLevel.Level1)
+                with torch_npu.profiler.profile(
+                    activities=[torch_npu.profiler.ProfilerActivity.CPU, torch_npu.profiler.ProfilerActivity.NPU],
+                    schedule=torch_npu.profiler.schedule(wait=0, warmup=0, active=1, repeat=1, skip_first=0),
+                    on_trace_ready=torch_npu.profiler.tensorboard_trace_handler("/home/lws/prof"),
+                    experimental_config=experimental_config,
+                    record_shapes=True,
+                    profile_memory=True,
+                    with_stack=False,
+                ) as prof:
+                    output_batch = self.pipeline.forward(req, self.server_args)
+            else:
+                output_batch = self.pipeline.forward(req, self.server_args)
             duration_ms = (time.monotonic() - start_time) * 1000
 
             if output_batch.timings:

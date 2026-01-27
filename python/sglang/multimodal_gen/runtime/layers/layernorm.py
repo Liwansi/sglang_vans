@@ -215,6 +215,21 @@ class LayerNorm(CustomOp):
         x = x.view(-1, self.hidden_size)
         return self.forward_triton(x).view(shape)
 
+    def forward_npu(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        normalized_shape = (x.size(-1),)
+        x = torch.nn.functional.layer_norm(
+            x,
+            normalized_shape=normalized_shape,
+            weight=self.weight,
+            bias=self.bias,
+            eps=self.eps
+        )
+        return x
+
     @torch.compile(backend="inductor", disable=_is_npu)
     def forward_native(
         self,
