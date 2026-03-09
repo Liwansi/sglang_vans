@@ -163,6 +163,25 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                 slot_indices=loc,
             )
 
+    def copy_kv_slots(self, src_slot_start: int, dst_slot_start: int, num_tokens: int):
+        """
+        Copy KV cache from [src_slot_start, src_slot_start + num_tokens)
+        to [dst_slot_start, dst_slot_start + num_tokens)
+        """
+        assert num_tokens <= self.page_size, "Copying across page boundary not supported here"
+
+        src_page = src_slot_start // self.page_size
+        src_offset = src_slot_start % self.page_size
+
+        dst_page = dst_slot_start // self.page_size
+        dst_offset = dst_slot_start % self.page_size
+
+        self.k_buffer[:, dst_page, dst_offset:dst_offset + num_tokens, :, :] = \
+            self.k_buffer[:, src_page, src_offset:src_offset + num_tokens, :, :]
+
+        self.v_buffer[:, dst_page, dst_offset:dst_offset + num_tokens, :, :] = \
+            self.v_buffer[:, src_page, src_offset:src_offset + num_tokens, :, :]
+
 
 class NPUMLATokenToKVPool(MLATokenToKVPool):
 

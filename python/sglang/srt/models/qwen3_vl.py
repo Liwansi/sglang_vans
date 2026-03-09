@@ -959,13 +959,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 name = name.replace(r"model.language_model.", r"model.")
             layer_id = get_layer_id(name)
 
-            # Only copy embed_tokens to lm_head when tie_word_embeddings=True
-            # For models with tie_word_embeddings=False (e.g. 8B), lm_head has independent weights
-            if (
-                self.pp_group.is_last_rank
-                and "model.embed_tokens.weight" in name
-                and self.config.tie_word_embeddings
-            ):
+            if self.pp_group.is_last_rank and "model.embed_tokens.weight" in name:
                 if "lm_head.weight" in params_dict:
                     lm_head_param = params_dict["lm_head.weight"]
                     weight_loader = getattr(
