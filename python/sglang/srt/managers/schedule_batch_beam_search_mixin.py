@@ -215,6 +215,7 @@ class ScheduleBatchBeamSearchMixin:
         if is_npu:
             new_page_num = new_reqs[0].beam_width - 1
             kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+            page_size = self.token_to_kv_pool_allocator.page_size
             for i, req in enumerate(new_reqs):
                 # 每个新请求，刚开始beam的时候需要额外分配 new_page_num 个 page
                 if new_page_num > len(self.token_to_kv_pool_allocator.free_pages):
@@ -234,31 +235,35 @@ class ScheduleBatchBeamSearchMixin:
                 origin_slots = req_pool[normal_idx, :seq_len].squeeze(0)  # 原始slot
 
                 # 计算prefill做完后，需要对齐尾块的page和slot
-                tail_block_num = (seq_len.item() - 1) % self.token_to_kv_pool_allocator.page_size + 1
-                N = seq_len.item() - tail_block_num
+                tail_block_num = (seq_len.item() - 1) % page_size + 1
+                N = seq_len.item() - tail_block_num # 长度N的slot维持原有分配page
                 base_slots = origin_slots[:N]
                 beam_indices = beam_req_pool_indices[beam_start:beam_end]
-                # 先把page对齐部分的slot拷贝到新beam_id
+                # 先把page对齐部分的slot拷贝到新beam_id，beam_id0维持不变
                 req_pool[beam_indices[0], :seq_len] = origin_slots
                 req_pool[beam_indices[1:], :N] = base_slots
 
-                # 再分配新page的slot
+                # 重新赋值尾块的slot
+                dst_slot_starts = torch.tensor(
+                    [p.item() * page_size for p in new_pages],
+                    device=req_pool.device,
+                    dtype=req_pool.dtype
+                )  # shape: [new_page_num]
+
+                dst_slots = dst_slot_starts.unsqueeze(1) + torch.arange(
+                    tail_block_num, device=req_pool.device, dtype=req_pool.dtype
+                )
+
+                req_pool[beam_indices[1:], N:N + tail_block_num] = dst_slots
+
+                # 再分配新page的kv
+                src_slot_start = origin_slots[N].item()
                 for i in range(len(new_pages)):
-                    new_page = new_pages[i]
-                    target_beam_idx = beam_indices[i + 1]
-                    dst_slot_start = new_page.item() * self.token_to_kv_pool_allocator.page_size
-                    req_pool[target_beam_idx, N:N + tail_block_num] = torch.arange(
-                        start=dst_slot_start,
-                        end=dst_slot_start + tail_block_num,
-                        device=req_pool.device,
-                        dtype=req_pool.dtype,
-                    )
                     kvcache.copy_kv_slots(
-                        src_slot_start=origin_slots[N].item(),
-                        dst_slot_start=dst_slot_start,
+                        src_slot_start=src_slot_start,
+                        dst_slot_start=dst_slot_starts[i].item(),
                         num_tokens=tail_block_num
                     )
-
 
                 beam_offset = beam_end
 
@@ -271,11 +276,6 @@ class ScheduleBatchBeamSearchMixin:
                 orig_seq_len = self.orig_seq_lens[skip_idx + i: skip_idx + i + 1]
                 expanded_orig_seq_lens = orig_seq_len.repeat(req.beam_width)
                 new_orig_seq_lens_list.append(expanded_orig_seq_lens)
-
-            new_req_pool_indices = torch.cat(new_req_pool_indices_list)
-            self.req_pool_indices = torch.cat(
-                [self.req_pool_indices[:skip_idx], new_req_pool_indices]
-            )
 
         else:
             for i, req in enumerate(new_reqs):

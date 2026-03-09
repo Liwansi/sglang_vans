@@ -866,36 +866,48 @@ class SchedulerBeamSearchProcessorMixin:
         # copy kv
         page_size = self.token_to_kv_pool_allocator.page_size
         kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+        device = self.req_to_token_pool.req_to_token.device
+        dtype = self.req_to_token_pool.req_to_token.dtype
+
         for key, value in src_to_dsts.items():
             if len(value) == 1:
                 continue
+
             new_page_num = len(value) - 1
             if new_page_num > len(self.token_to_kv_pool_allocator.free_pages):
                 self.merge_and_sort_free()
             if new_page_num > len(self.token_to_kv_pool_allocator.free_pages):
                 return None
+
             new_pages = self.token_to_kv_pool_allocator.free_pages[:new_page_num]
             self.token_to_kv_pool_allocator.free_pages = self.token_to_kv_pool_allocator.free_pages[new_page_num:]
 
-
-            # 只需要拷贝尾块
+            # 计算尾块
             seq_len = pool_idx_to_seq_len[key]
-            tail_num = (seq_len - 1) % self.token_to_kv_pool_allocator.page_size + 1
-            N = seq_len - tail_num # 这部分保持不变
+            tail_num = (seq_len - 1) % page_size + 1
+            N = seq_len - tail_num
 
-            for i in range(1, len(value)):
-                new_page = new_pages[i - 1]
-                dst_page_start_slot = new_page * page_size
-                dst_slot_indices = torch.arange(
-                    dst_page_start_slot,
-                    dst_page_start_slot + tail_num,
-                    dtype=torch.int32,
-                    device=batch.device
-                )
-                self.req_to_token_pool.req_to_token[value[i], N:seq_len] = dst_slot_indices
+            src_slot_start = self.req_to_token_pool.req_to_token[key, N].item()
+
+            new_pages_tensor = torch.tensor(new_pages, device=device, dtype=dtype)
+            dst_page_start_slots = new_pages_tensor * page_size
+
+            dst_slot_indices = (
+                dst_page_start_slots.unsqueeze(1) +
+                torch.arange(tail_num, device=device, dtype=dtype)
+            )
+
+            dst_req_ids = value[1:]
+            # 重新赋值尾块的slot
+            self.req_to_token_pool.req_to_token[
+            dst_req_ids, N:seq_len
+            ] = dst_slot_indices
+
+            # 再分配新page的kv
+            for i, dst_start in enumerate(dst_page_start_slots):
                 kvcache.copy_kv_slots(
-                    src_slot_start=self.req_to_token_pool.req_to_token[key, N].item(),
-                    dst_slot_start=dst_page_start_slot,
+                    src_slot_start=src_slot_start,
+                    dst_slot_start=dst_start.item(),
                     num_tokens=tail_num
                 )
 
