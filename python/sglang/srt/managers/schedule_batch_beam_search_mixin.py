@@ -219,7 +219,7 @@ class ScheduleBatchBeamSearchMixin:
             for i, req in enumerate(new_reqs):
                 # 每个新请求，刚开始beam的时候需要额外分配 new_page_num 个 page
                 if new_page_num > len(self.token_to_kv_pool_allocator.free_pages):
-                    self.merge_and_sort_free()
+                    self.token_to_kv_pool_allocator.merge_and_sort_free()
                 if new_page_num > len(self.token_to_kv_pool_allocator.free_pages):
                     return None
                 new_pages = self.token_to_kv_pool_allocator.free_pages[:new_page_num]

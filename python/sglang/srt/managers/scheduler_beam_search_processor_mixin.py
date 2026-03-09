@@ -875,7 +875,7 @@ class SchedulerBeamSearchProcessorMixin:
 
             new_page_num = len(value) - 1
             if new_page_num > len(self.token_to_kv_pool_allocator.free_pages):
-                self.merge_and_sort_free()
+                self.token_to_kv_pool_allocator.merge_and_sort_free()
             if new_page_num > len(self.token_to_kv_pool_allocator.free_pages):
                 return None
 
