@@ -482,7 +482,8 @@ class RadixCache(BasePrefixCache):
             )
 
         # free the unaligned tail
-        self.token_to_kv_pool_allocator.free(kv_indices[len(keys) :])
+        if not req.is_beam_search:
+            self.token_to_kv_pool_allocator.free(kv_indices[len(keys) :])
 
         # Remove req slot release the cache lock
         self.req_to_token_pool.free(req.req_pool_idx)

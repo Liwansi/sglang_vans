@@ -40,6 +40,11 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
 )
 from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.utils import (
+    is_npu,
+)
+
+_is_npu = is_npu()
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
@@ -842,74 +847,18 @@ class SchedulerBeamSearchProcessorMixin:
         # Copy KV cache for all beams (including src == dst cases)
         # Although this may read some indices redundantly, it simplifies the code
         # and performs better in practice by avoiding branching overhead
-        keep_kv_indices, src_to_dsts = self._copy_kvcache_for_beams(
+        keep_kv_indices = self._copy_kvcache_for_beams(
             src_pool_indices,
             beam_req_pool_indices,
             prompt_lens,
             seq_lens_batch,
             batch.device,
         )
-        pool_idx_to_seq_len = {}
-        offset = 0
-        for req in reqs:
-            for b in range(req.beam_width):
-                pool_idx = beam_req_pool_indices[offset + b].item()
-                pool_idx_to_seq_len[pool_idx] = seq_lens_batch[offset + b].item()
-            offset += req.beam_width
-
         uniques, counts = torch.unique(
             torch.cat([last_beam_kv_indices, keep_kv_indices]), return_counts=True
         )
         free_kv_indices = uniques[counts == 1]
         self.token_to_kv_pool_allocator.free(free_kv_indices)
-
-        # copy kv
-        page_size = self.token_to_kv_pool_allocator.page_size
-        kvcache = self.token_to_kv_pool_allocator.get_kvcache()
-        device = self.req_to_token_pool.req_to_token.device
-        dtype = self.req_to_token_pool.req_to_token.dtype
-
-        for key, value in src_to_dsts.items():
-            if len(value) == 1:
-                continue
-
-            new_page_num = len(value) - 1
-            if new_page_num > len(self.token_to_kv_pool_allocator.free_pages):
-                self.token_to_kv_pool_allocator.merge_and_sort_free()
-            if new_page_num > len(self.token_to_kv_pool_allocator.free_pages):
-                return None
-
-            new_pages = self.token_to_kv_pool_allocator.free_pages[:new_page_num]
-            self.token_to_kv_pool_allocator.free_pages = self.token_to_kv_pool_allocator.free_pages[new_page_num:]
-
-            # 计算尾块
-            seq_len = pool_idx_to_seq_len[key]
-            tail_num = (seq_len - 1) % page_size + 1
-            N = seq_len - tail_num
-
-            src_slot_start = self.req_to_token_pool.req_to_token[key, N].item()
-
-            new_pages_tensor = torch.tensor(new_pages, device=device, dtype=dtype)
-            dst_page_start_slots = new_pages_tensor * page_size
-
-            dst_slot_indices = (
-                dst_page_start_slots.unsqueeze(1) +
-                torch.arange(tail_num, device=device, dtype=dtype)
-            )
-
-            dst_req_ids = value[1:]
-            # 重新赋值尾块的slot
-            self.req_to_token_pool.req_to_token[
-            dst_req_ids, N:seq_len
-            ] = dst_slot_indices
-
-            # 再分配新page的kv
-            for i, dst_start in enumerate(dst_page_start_slots):
-                kvcache.copy_kv_slots(
-                    src_slot_start=src_slot_start,
-                    dst_slot_start=dst_start.item(),
-                    num_tokens=tail_num
-                )
 
 
     def _batch_collect_range_kv_indices(
@@ -941,6 +890,36 @@ class SchedulerBeamSearchProcessorMixin:
             ... )
             # Returns unique KV indices from ranges [5:10], [8:15], [6:12]
         """
+        if _is_npu:
+            page_size = self.token_to_kv_pool_allocator.page_size
+
+            # 计算对齐后的起始位置（去掉尾块的起点）
+            aligned_prefix_lens = (prefix_lens // page_size) * page_size
+
+            # 计算每个请求要提取的长度
+            extract_lens = seq_lens - aligned_prefix_lens
+            extract_lens = torch.clamp(extract_lens, min=0)
+
+            if extract_lens.max().item() == 0:
+                return torch.empty(0, dtype=torch.int64, device=device)
+
+            max_extract_len = extract_lens.max().item()
+
+            # 构造 position indices: [aligned_prefix_lens, seq_lens)
+            position_indices = torch.arange(
+                max_extract_len, dtype=torch.int64, device=device
+            ).unsqueeze(0) + aligned_prefix_lens.unsqueeze(1)
+
+            # mask 有效位置
+            mask = position_indices < seq_lens.unsqueeze(1)
+
+            # 批量索引
+            batch_kv_indices = self.req_to_token_pool.req_to_token[
+                pool_indices.unsqueeze(1), position_indices
+            ]
+
+            return batch_kv_indices[mask].unique()
+
         num_reqs = len(pool_indices)
         if prefix_lens is None:
             prefix_lens = torch.zeros(num_reqs, dtype=torch.int64, device=device)
@@ -1024,15 +1003,6 @@ class SchedulerBeamSearchProcessorMixin:
             from index X expecting old data). Within the same group, overlapping is safe as
             copies are parallel.
         """
-        src_list = src_pool_indices.cpu().tolist()
-        dst_list = dst_pool_indices.cpu().tolist()
-
-        src_to_dsts = {}
-        for src, dst in zip(src_list, dst_list):
-            if src not in src_to_dsts:
-                src_to_dsts[src] = []
-            src_to_dsts[src].append(dst)
-
         if len(prompt_lens.unique()) == 1 and len(seq_lens_batch.unique()) == 1:
             prompt_len = prompt_lens[0].item()
             seq_len = seq_lens_batch[0].item()
@@ -1042,7 +1012,7 @@ class SchedulerBeamSearchProcessorMixin:
                 prompt_len,
                 seq_len,
             )
-            return kvcache_batch_unique, src_to_dsts
+            return kvcache_batch_unique
         else:
             # Group by (prompt_len, seq_len) for processing
             seq_lens_cpu = seq_lens_batch.cpu()
@@ -1102,6 +1072,103 @@ class SchedulerBeamSearchProcessorMixin:
             If src_indices = [0, 0, 1], only reads from indices 0 and 1 once,
             then replicates the result for the duplicate source.
         """
+        if _is_npu:
+            src_list = src_indices.cpu().tolist()
+            dst_list = dst_indices.cpu().tolist()
+
+            src_to_dsts = {}
+            for src, dst in zip(src_list, dst_list):
+                if src not in src_to_dsts:
+                    src_to_dsts[src] = []
+                src_to_dsts[src].append(dst)
+
+            # 计算尾块
+            page_size = self.token_to_kv_pool_allocator.page_size
+            kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+            device = self.req_to_token_pool.req_to_token.device
+            dtype = self.req_to_token_pool.req_to_token.dtype
+
+            N = ((prefix_len - 1) // page_size) * page_size if prefix_len > 0 else 0
+            tail_num = seq_len - N
+            num_page_per_tail = (tail_num + page_size - 1) // page_size
+
+            from collections import defaultdict
+
+            src_slot_start_slots = defaultdict(list)
+
+            for key, value in src_to_dsts.items():
+                if len(value) <= 1:
+                    continue
+                for i in range(num_page_per_tail):
+                    token_pos = N + page_size * i
+                    if token_pos >= self.req_to_token_pool.req_to_token.size(1):
+                        break
+                    slot_id = self.req_to_token_pool.req_to_token[key, token_pos].item()
+                    src_slot_start_slots[key].append(slot_id)
+
+            unique_src_indices, inverse_indices = torch.unique(
+                src_indices, return_inverse=True
+            )
+            kvcache_batch_unique = self.req_to_token_pool.req_to_token[
+                                   unique_src_indices, N:seq_len
+                                   ].clone()
+            kvcache_batch = kvcache_batch_unique[inverse_indices]
+            self.req_to_token_pool.req_to_token[dst_indices, N:seq_len] = (
+                kvcache_batch
+            )
+
+            # copy kv
+            for key, value in src_to_dsts.items():
+                if len(value) == 1:
+                    continue
+
+                new_page_num = (len(value) - 1) * num_page_per_tail
+                if new_page_num > len(self.token_to_kv_pool_allocator.free_pages):
+                    self.token_to_kv_pool_allocator.merge_and_sort_free()
+                if new_page_num > len(self.token_to_kv_pool_allocator.free_pages):
+                    return None
+
+                new_pages = self.token_to_kv_pool_allocator.free_pages[:new_page_num]
+                self.token_to_kv_pool_allocator.free_pages = self.token_to_kv_pool_allocator.free_pages[new_page_num:]
+
+                src_slot_start = src_slot_start_slots[key]
+
+                new_pages_tensor = torch.tensor(new_pages, device=device, dtype=dtype)
+                dst_page_start_slots = new_pages_tensor * page_size
+
+                dst_req_ids = value[1:]
+                if num_page_per_tail == 1:
+                    dst_slot_indices = (
+                        dst_page_start_slots.unsqueeze(1) +
+                        torch.arange(tail_num, device=device, dtype=dtype)
+                    )
+                else:
+                    page_starts = dst_page_start_slots.view(len(dst_req_ids), num_page_per_tail)
+                    page_offsets = torch.arange(page_size, device=device, dtype=dtype)
+                    slot_grid = page_starts.unsqueeze(-1) + page_offsets
+                    dst_slot_indices = slot_grid.flatten(1)[:, :tail_num]
+
+                # 重新赋值尾块的slot
+                self.req_to_token_pool.req_to_token[dst_req_ids, N:seq_len] = dst_slot_indices
+                # 再分配新page的kv
+                for idx, dst_start_slot in enumerate(dst_page_start_slots):
+                    j = idx % num_page_per_tail
+                    src_start = src_slot_start[j]
+                    dst_start = dst_start_slot.item()
+
+                    token_offset = j * page_size
+                    if token_offset >= tail_num:
+                        break
+                    num_tokens = min(page_size, tail_num - token_offset)
+
+                    kvcache.copy_kv_slots(
+                        src_slot_start=src_start,
+                        dst_slot_start=dst_start,
+                        num_tokens=num_tokens
+                    )
+
+            return kvcache_batch_unique.flatten().unique()
+
         unique_src_indices, inverse_indices = torch.unique(
             src_indices, return_inverse=True
         )

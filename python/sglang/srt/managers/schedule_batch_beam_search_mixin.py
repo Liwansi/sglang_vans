@@ -212,7 +212,7 @@ class ScheduleBatchBeamSearchMixin:
         beam_offset = 0
         req_pool = self.req_to_token_pool.req_to_token
 
-        if is_npu:
+        if _is_npu:
             new_page_num = new_reqs[0].beam_width - 1
             kvcache = self.token_to_kv_pool_allocator.get_kvcache()
             page_size = self.token_to_kv_pool_allocator.page_size
