@@ -410,16 +410,6 @@ class Qwen3ForCausalLM(nn.Module):
             input_embeds,
             pp_proxy_tensors=pp_proxy_tensors,
         )
-        if forward_batch.forward_mode.is_decode():
-            print(
-                f"[ANNADEBUG][qwen3][forward] hidden_states: {hidden_states[:, :10]}, input_ids: {input_ids[:5]}"
-                f"seq_len: {forward_batch.seq_lens=}\n"
-            )
-        else:
-            print(
-                f"[ANNADEBUG][qwen3][forward] input_ids_len: {len(input_ids)}\n"
-            )
-        #positions: {positions}, type: {type(self.model)}, forward_batch: {forward_batch}
 
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
