@@ -1,6 +1,7 @@
 # Adapted from qwen2.py
 import logging
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+import time
 
 import torch
 from torch import nn
@@ -31,12 +32,15 @@ from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_cuda, is_npu
+from sglang.srt.utils import get_bool_env_var
 
 Qwen3Config = None
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+
+_debug_msg = get_bool_env_var("DEBUG_TIME_MSG")
 
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
@@ -403,6 +407,9 @@ class Qwen3ForCausalLM(nn.Module):
         get_embedding: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        if _debug_msg:
+            torch.get_device_module().synchronize()
+            time_start = time.time()
         hidden_states = self.model(
             input_ids,
             positions,
@@ -417,13 +424,23 @@ class Qwen3ForCausalLM(nn.Module):
 
         if self.pp_group.is_last_rank:
             if not get_embedding:
-                return self.logits_processor(
+                logits = self.logits_processor(
                     input_ids,
                     hidden_states,
                     self.lm_head,
                     forward_batch,
                     aux_hidden_states,
                 )
+                if _debug_msg:
+                    torch.get_device_module().synchronize()
+                    time_end = time.time()
+                    mode = "decode" if forward_batch.forward_mode.is_decode() else "prefill"
+                    elapsed_ms = (time_end - time_start) * 1000
+                    print(
+                        f"[ANNADEBUG][qwen3][forward] "
+                        f"mode={mode} | time={elapsed_ms:6.2f} ms"
+                    )
+                return logits
             else:
                 return self.pooler(hidden_states, forward_batch)
         else:
