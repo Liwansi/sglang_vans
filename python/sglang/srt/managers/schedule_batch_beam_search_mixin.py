@@ -213,7 +213,7 @@ class ScheduleBatchBeamSearchMixin:
         req_pool = self.req_to_token_pool.req_to_token
 
         if _is_npu:
-            new_page_num = new_reqs[0].beam_width - 1
+            new_page_num = new_reqs[0].beam_width
             kvcache = self.token_to_kv_pool_allocator.get_kvcache()
             page_size = self.token_to_kv_pool_allocator.page_size
             for i, req in enumerate(new_reqs):
@@ -239,9 +239,7 @@ class ScheduleBatchBeamSearchMixin:
                 N = seq_len.item() - tail_block_num # 长度N的slot维持原有分配page
                 base_slots = origin_slots[:N]
                 beam_indices = beam_req_pool_indices[beam_start:beam_end]
-                # 先把page对齐部分的slot拷贝到新beam_id，beam_id0维持不变
-                req_pool[beam_indices[0], :seq_len] = origin_slots
-                req_pool[beam_indices[1:], :N] = base_slots
+                req_pool[beam_indices, :N] = base_slots
 
                 # 重新赋值尾块的slot
                 dst_slot_starts = torch.tensor(
@@ -254,7 +252,7 @@ class ScheduleBatchBeamSearchMixin:
                     tail_block_num, device=req_pool.device, dtype=req_pool.dtype
                 )
 
-                req_pool[beam_indices[1:], N:N + tail_block_num] = dst_slots
+                req_pool[beam_indices, N:N + tail_block_num] = dst_slots
 
                 # 再分配新page的kv
                 src_slot_start = origin_slots[N].item()
