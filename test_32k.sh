@@ -1,0 +1,1 @@
+ais_bench --models vllm_api_stream_chat --custom-dataset-data-type qa --debug --summarizer default_perf --mode perf --num-prompts 30 --custom-dataset-path /home/lws/sglang/aisbench_auto_tools_prefix/dataset/GSM8K-in204800-bs30-Qwen3-235B-A22B-Instruct-2507-w8a8.jsonl
