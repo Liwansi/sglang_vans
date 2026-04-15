@@ -625,6 +625,7 @@ class Scheduler(
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             self.tp_worker.get_memory_pool()
         )
+        print(f"[init] free pages: {len(self.token_to_kv_pool_allocator.free_pages)}")
 
         # Create cache
         params = CacheInitParams(

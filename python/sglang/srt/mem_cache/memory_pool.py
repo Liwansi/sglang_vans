@@ -147,6 +147,7 @@ class ReqToTokenPool:
             )
 
         self.free_slots = list(range(size))
+        print(f"{len(self.free_slots)=}")
 
     def write(self, indices, values):
         self.req_to_token[indices] = values

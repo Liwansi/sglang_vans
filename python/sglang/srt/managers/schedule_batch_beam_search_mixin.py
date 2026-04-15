@@ -192,9 +192,9 @@ class ScheduleBatchBeamSearchMixin:
 
         if not new_reqs:
             return
-
         new_pool_slot_list = [req.beam_width for req in new_reqs]
         beam_req_pool_indices = self.req_to_token_pool.alloc(sum(new_pool_slot_list))
+        print(f"{len(new_reqs)=} {new_pool_slot_list=}")
         if not beam_req_pool_indices:
             raise RuntimeError(
                 "Out of memory. Please set a smaller number for `--max-running-requests` or `--beam-width`."
@@ -211,6 +211,8 @@ class ScheduleBatchBeamSearchMixin:
 
         beam_offset = 0
         req_pool = self.req_to_token_pool.req_to_token
+
+        print(f"[begin] free pages: {len(self.token_to_kv_pool_allocator.free_pages)}")
 
         if _is_npu:
             new_page_num = new_reqs[0].beam_width
