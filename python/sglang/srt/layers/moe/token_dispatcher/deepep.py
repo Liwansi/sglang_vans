@@ -597,6 +597,10 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         # `handle` as a member variable works.
 
         _deepep_precompile_tp_barrier()
+        # for i, item in enumerate(x):
+        #     print(f"Element {i}: shape={item.shape}, dtype={item.dtype}")
+        if isinstance(x, tuple):
+            x =x[0]
         (
             recv_x,
             recv_topk_ids,

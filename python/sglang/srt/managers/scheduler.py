@@ -3330,33 +3330,40 @@ class Scheduler(
                 self._relay_forward_payload(batch.req_pool_indices, batch_result)
                 batch.input_ids = None
             elif not batch.spec_algorithm.is_none():
+                kwargs = (
+                    {"pp_proxy_tensors": pp_proxy_tensors}
+                    if self.ps.pp_size > 1
+                       and batch.spec_algorithm == SpeculativeAlgorithm.EAGLE
+                    else {}
+                )
                 # Non-overlap: drive the V2 worker synchronously (no
                 # future_map relay / on_publish).
                 resolve_forward_inputs(batch, self.future_map)
                 with self._forward_isolation(batch, overlap=False):
-                    batch_result = self.model_worker.forward_batch_generation(batch)
+                    batch_result = self.model_worker.forward_batch_generation(
+                        batch, **kwargs
+                    )
                 # The isolation restore reverted the worker's in-forward SB edits;
                 # re-apply what must carry to the next iter.
-                batch.spec_info = batch_result.next_draft_input
-                if batch_result.new_seq_lens is not None:
-                    batch.seq_lens = batch_result.new_seq_lens
-                    if batch.seq_lens_cpu is not None:
-                        batch.seq_lens_cpu = batch_result.new_seq_lens.to("cpu")
-                        batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
-                batch.input_ids = None  # rebuilt next iter from draft_token
+                if self.pp_group.is_last_rank:
+                    batch.spec_info = batch_result.next_draft_input
+                    if batch_result.new_seq_lens is not None:
+                        batch.seq_lens = batch_result.new_seq_lens
+                        if batch.seq_lens_cpu is not None:
+                            batch.seq_lens_cpu = batch_result.new_seq_lens.to("cpu")
+                            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+                    batch.input_ids = None  # rebuilt next iter from draft_token
                 self.update_cache_from_scheduler(batch, batch_result)
                 # Sync D2H so the result processor can read CPU tensors.
-                batch_result.copy_done = self.device_module.Event()
-                batch_result.copy_to_cpu(
-                    return_logprob=batch.return_logprob,
-                    return_hidden_states=batch.return_hidden_states,
-                )
+                # Non-last PP ranks don't have next_token_ids (no sampling).
+                if self.pp_group.is_last_rank:
+                    batch_result.copy_done = self.device_module.Event()
+                    batch_result.copy_to_cpu(
+                        return_logprob=batch.return_logprob,
+                        return_hidden_states=batch.return_hidden_states,
+                    )
             else:
-                kwargs = (
-                    {"pp_proxy_tensors": pp_proxy_tensors}
-                    if self.spec_algorithm.is_none()
-                    else {}
-                )
+                kwargs = {"pp_proxy_tensors": pp_proxy_tensors}
                 resolve_forward_inputs(batch, self.future_map)
                 batch_result = self.model_worker.forward_batch_generation(
                     batch, **kwargs

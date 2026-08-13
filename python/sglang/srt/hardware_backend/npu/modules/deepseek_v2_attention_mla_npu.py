@@ -584,7 +584,7 @@ def forward_dsa_prepare_npu(
                 m, positions, q_pe, k_pe, forward_batch
             )
         else:
-            if m.layer_id == 0:
+            if m.layer_id == get_token_to_kv_pool().start_layer:
                 m.rotary_emb.sin_cos_cache = m.rotary_emb.cos_sin_cache.index_select(
                     0, positions
                 )
