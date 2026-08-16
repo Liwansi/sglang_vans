@@ -255,6 +255,121 @@ _enable_pcg_dsv2_dual_stream = (
 )
 
 
+
+import triton
+import triton.language as tl
+from sgl_kernel_npu.utils.triton_utils import get_device_properties
+
+FP8_E4M3_MAX: float = 448.0
+E8M0_BIAS: int = 127
+MX_BLOCK_SIZE: int = 32
+
+
+@triton.jit
+def _swiglu_quant_mxfp8_kernel(
+    x_ptr,
+    out_ptr,
+    scale_ptr,
+    TOTAL_ROWS: tl.constexpr,
+    HALF_COLS: tl.constexpr,
+    MX_BLOCK_SIZE: tl.constexpr,
+    NUM_BLOCKS_PER_ROW: tl.constexpr,
+    ROW_PER_PROGRAM: tl.constexpr,
+):
+    FP8_E4M3_MAX: tl.constexpr = 448.0
+    E8M0_BIAS: tl.constexpr = 127
+
+    pid = tl.program_id(0)
+    row_begin = pid * ROW_PER_PROGRAM
+    if row_begin >= TOTAL_ROWS:
+        return
+    row_end = tl.minimum((pid + 1) * ROW_PER_PROGRAM, TOTAL_ROWS)
+
+    # 2D block offsets: (NUM_BLOCKS_PER_ROW, MX_BLOCK_SIZE)
+    blk_ids = tl.arange(0, NUM_BLOCKS_PER_ROW)
+    elem_ids = tl.arange(0, MX_BLOCK_SIZE)
+    col_2d = blk_ids[:, None] * MX_BLOCK_SIZE + elem_ids[None, :]
+
+    for row_idx in range(row_begin, row_end):
+        # Load x1 and x2 as 2D blocks
+        x1 = tl.load(x_ptr + row_idx * 2 * HALF_COLS + col_2d).to(tl.float32)
+        x2 = tl.load(
+            x_ptr + row_idx * 2 * HALF_COLS + HALF_COLS + col_2d
+        ).to(tl.float32)
+
+        # SwiGLU (fully vectorized)
+        swiglu = x1 * tl.sigmoid(x1) * x2
+
+        # Per-block amax (reduce along axis=1)
+        amax = tl.max(tl.abs(swiglu), axis=1)
+
+        # e8m0 scale computation (vectorized over all blocks)
+        amax_safe = tl.where(amax > 0.0, amax, 1.0)
+        scale_exp = tl.ceil(tl.log2(amax_safe / FP8_E4M3_MAX) - 1e-6)
+        e8m0_val = scale_exp + E8M0_BIAS
+        e8m0_val = tl.where(amax > 0.0, e8m0_val, E8M0_BIAS)
+        e8m0_val = tl.minimum(tl.maximum(e8m0_val, 0.0), 255.0)
+        actual_scale = tl.exp2(e8m0_val - E8M0_BIAS)
+
+        # Store e8m0 scales
+        tl.store(
+            scale_ptr + row_idx * NUM_BLOCKS_PER_ROW + blk_ids,
+            e8m0_val.to(scale_ptr.dtype.element_ty),
+        )
+
+        # Quantize via broadcasting division and store
+        quantized = (swiglu / actual_scale[:, None]).to(out_ptr.dtype.element_ty)
+        tl.store(out_ptr + row_idx * HALF_COLS + col_2d, quantized)
+
+
+def swiglu_quant_mxfp8(x):
+    """Fused SwiGLU + MXFP8 (e4m3 + e8m0) per-32-block quantization.
+
+    SwiGLU: out = x1 * sigmoid(x1) * x2, where x is split into [x1, x2].
+    Then each 32-element block is quantized to e4m3 with a shared e8m0 scale.
+
+    Args:
+        x: ``(S, H)`` bf16/fp16 input where ``H = 2 * output_dim``.
+
+    Returns:
+        (out, scale) where:
+        - out:   ``(S, H//2)``     ``torch.float8_e4m3fn``
+        - scale: ``(S, H//2//32)`` ``torch.uint8`` (e8m0: value represents ``2**(v-127)``)
+    """
+    s, h = x.shape
+    half_cols = h // 2
+
+    if half_cols % MX_BLOCK_SIZE != 0:
+        raise ValueError(
+            f"Output dimension ({half_cols}) must be divisible by "
+            f"MXFP8 block size ({MX_BLOCK_SIZE})"
+        )
+
+    num_blocks_per_row = half_cols // MX_BLOCK_SIZE
+    out = torch.empty((s, half_cols), dtype=torch.float8_e4m3fn, device=x.device)
+    scale = torch.empty((s, num_blocks_per_row), dtype=torch.uint8, device=x.device)
+
+    _, num_vectorcore = get_device_properties()
+
+    # Choose rows per program to maximize occupancy
+    row_per_program = min(s, max(1, (s + num_vectorcore - 1) // num_vectorcore))
+    num_programs = triton.cdiv(s, row_per_program)
+
+    _swiglu_quant_mxfp8_kernel[(num_programs,)](
+        x,
+        out,
+        scale,
+        TOTAL_ROWS=s,
+        HALF_COLS=half_cols,
+        MX_BLOCK_SIZE=MX_BLOCK_SIZE,
+        NUM_BLOCKS_PER_ROW=num_blocks_per_row,
+        ROW_PER_PROGRAM=row_per_program,
+        num_stages=2,
+        multibuffer=True,
+    )
+    return out, scale
+
+
 def _get_shared_expert_fp8_block_size(
     gate_up_quant_method: Any, down_quant_method: Any
 ) -> Optional[List[int]]:
@@ -470,7 +585,8 @@ class DeepseekV2MLP(nn.Module):
                 x = gate_up.new_empty((M, N // 2))
                 silu_and_mul_clamp(gate_up, x, float(self.swiglu_limit))
         else:
-            x = self.act_fn(gate_up)
+            x = swiglu_quant_mxfp8(gate_up)
+            # x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
 
