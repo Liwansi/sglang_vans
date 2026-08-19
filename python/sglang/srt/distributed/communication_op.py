@@ -66,10 +66,14 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group(
 
 
 def attn_o_model_parallel_all_to_all(input_):
-    output = torch.empty_like(input_)
     group = get_attn_o_tp_group().device_group
-    torch.distributed.all_to_all_single(output=output, input=input_, group=group)
-    return output
+    world_size = get_attn_o_tensor_parallel_world_size()
+    input_list = [t.contiguous() for t in torch.tensor_split(input_, world_size, 0)]
+    output_list = [torch.empty_like(input_list[i]) for i in range(world_size)]
+    torch.distributed.all_to_all(output_list, input_list, group=group)
+    output_tensor = torch.cat(output_list, dim=0)
+    return output_tensor
+
 
 def attn_o_model_parallel_reduce_scatter(input_):
     out_shape = list(input_.shape)

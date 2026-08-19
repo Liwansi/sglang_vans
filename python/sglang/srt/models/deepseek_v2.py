@@ -2264,50 +2264,49 @@ class DeepseekV2AttentionMLA(
         max_bsz = self._get_o_tp_max_bsz()
         if forward_batch.forward_mode.is_idle() or hidden_states.shape[0] == 0:
             return torch.zeros(
-                (max_bsz, self.num_local_heads, self.v_head_dim),
+                (max_bsz, self.num_local_heads * self.v_head_dim),
                 device=hidden_states.device,
                 dtype=hidden_states.dtype,
             )
-        S = hidden_states.shape[0]
-        hidden_states = hidden_states.view(S, self.num_local_heads, self.v_head_dim)
+        S, H = hidden_states.shape
         pad_size = max_bsz - S
         if pad_size > 0:
-            return F.pad(hidden_states, (0, 0, 0, 0, 0, pad_size), mode="constant", value=0)
+            return F.pad(hidden_states, (0, 0, 0, pad_size), mode="constant", value=0)
         return hidden_states
 
     def post_process_for_o_tp(self, hidden_states, org_hidden_states, forward_batch):
         if forward_batch.forward_mode.is_idle() or org_hidden_states.shape[0] == 0:
-            return org_hidden_states
+            return org_hidden_states.new_zeros(
+                (org_hidden_states.shape[0], self.hidden_size)
+            )
         bs = org_hidden_states.shape[0]
-        return hidden_states[:bs, ...]
+        return hidden_states[:bs, ...].clone()
 
     def forward_attn_out_with_o_tp(self, hidden_states, forward_batch):
         org_hidden_states = hidden_states
         hidden_states = self.pre_process_for_o_tp(hidden_states, forward_batch)
-        S, G, D = hidden_states.shape
+        S, H = hidden_states.shape  # B, 128 128
         # Split heads into attn_o_tp_size groups, then all-to-all so each
         # rank receives all tokens for its head subset.
         hidden_states = (
             hidden_states.reshape(
                 S,
                 self.attn_o_tp_size,
-                G // self.attn_o_tp_size,
-                D,
+                H // self.attn_o_tp_size,
             )
             .transpose(0, 1)
             .contiguous()
-        ).reshape(-1)
+        )
         hidden_states = attn_o_model_parallel_all_to_all(input_=hidden_states)
         hidden_states = hidden_states.view(
             S * self.attn_o_tp_size,
-            G // self.attn_o_tp_size,
-            D,
-        ).reshape(S * self.attn_o_tp_size, -1)
+            H // self.attn_o_tp_size,
+        )
         # o_proj with reduce_results=False: only local matmul, no all-reduce.
-        output = self.o_proj(hidden_states)[0]
+        output = self.o_proj(hidden_states)[0]  # [S * tp, V]
         # reduce_scatter sums partial o_proj results across head groups and
         # returns each rank's own S tokens.
-        output = attn_o_model_parallel_reduce_scatter(input_=output.view(-1, self.hidden_size))
+        output = attn_o_model_parallel_reduce_scatter(input_=output)
         output = output.reshape(S, -1).contiguous()
         output = self.post_process_for_o_tp(output, org_hidden_states, forward_batch)
         return output
