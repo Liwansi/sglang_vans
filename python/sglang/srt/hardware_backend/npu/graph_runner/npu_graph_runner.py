@@ -74,11 +74,13 @@ def patch_model_npu(
 ):
     if enable_compile:
         backend = get_compiler_backend("npugraph_ex")
+        options = {"static_kernel_compile": True, "disable_static_kernel_compile_cache": False}
         yield torch.compile(
             torch.no_grad()(model.forward),
             fullgraph=True,
             dynamic=False,
             backend=backend,
+            options=options,
         )
     else:
         yield model.forward
