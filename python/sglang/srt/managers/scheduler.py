@@ -3035,11 +3035,34 @@ class Scheduler(
             # prefill-eligible iteration can schedule without an extra pass.
             running_batch.batch_is_full = False
             ret = None
-            # Preserve DP-attention MLP sync even when idle.
+            # Preserve DP-attention MLP sync even when idle. Mirror the spec
+            # branch of the slow path below (the `need_mlp_sync` block around
+            # the two maybe_prepare_mlp_sync_batch calls): with spec + DP
+            # attention, a busy rank issues TWO mlp-sync all_gathers per
+            # iteration (SYNC#1 on the empty new batch, then SYNC#2 on the
+            # decode batch), while an idle rank on this fast path must issue
+            # the same count. The mlp-sync all_gather and the recv_requests
+            # control broadcast share the tp cpu (gloo) group, so a count skew
+            # deadlocks: the busy rank blocks in its extra all_gather while
+            # the idle rank blocks in the next iteration's broadcast.
+            # SYNC#1 itself keeps the counts self-consistent: when any rank
+            # has prefill tokens, it distributes idle batches so every rank's
+            # new batch is non-None and everyone skips SYNC#2; when none does,
+            # everyone's stays None and everyone issues SYNC#2.
             if self.require_mlp_sync:
-                ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
-                    ret, need_sync=True
-                )
+                need_mlp_sync = True
+                if (
+                    not self.spec_algorithm.is_none()
+                    and not get_spec().speculative_skip_dp_mlp_sync
+                ):
+                    ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
+                        ret, need_sync=True
+                    )
+                    need_mlp_sync = ret is None
+                if need_mlp_sync:
+                    ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
+                        ret, need_sync=True
+                    )
             ret = self.ngram_embedding_manager.prepare_for_forward(
                 ret, chunked_req=self.chunked_req
             )
