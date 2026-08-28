@@ -1,4 +1,4 @@
-"""A5 integration test for a 128K request with a 90% HiCache host hit.
+"""A5 H2D example for a 128K request with a 90% HiCache host hit.
 
 This intentionally calls ``memfabric_hybrid.offload.kv_exchange_copy``
 directly with the same metadata ABI used by MLATokenToKVPoolHost.  It models
@@ -15,10 +15,8 @@ Run on an Atlas A5 worker after sourcing the same memfabric environment as
     export PYTHONPATH=/path/to/sglang_vans/python:$PYTHONPATH
     export SGLANG_HICACHE_HOST_MEM=hybm
     export SGLANG_HICACHE_IO_ASCENDC=1
-    python python/test_npu_kv_exchange_copy_128k_prefix90.py -v
+    python python/kv_exchange_copy_128k_prefix90.py
 """
-
-import unittest
 
 import torch
 
@@ -75,18 +73,21 @@ def _hybm_empty(shape, dtype):
     )
 
 
-class TestNPUKVExchangeCopy128KPrefix90(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        if not hasattr(torch, "npu") or not torch.npu.is_available():
-            raise unittest.SkipTest("This integration test requires an Ascend NPU")
-        try:
-            from memfabric_hybrid import offload  # noqa: F401
-        except ImportError as exc:
-            raise unittest.SkipTest(f"memfabric_hybrid is unavailable: {exc}")
+def _require(condition, message):
+    if not condition:
+        raise RuntimeError(message)
 
-    def test_h2d_packed_kv_and_indexer_for_90_percent_prefix(self):
-        from memfabric_hybrid import offload
+
+def main():
+        _require(
+            hasattr(torch, "npu") and torch.npu.is_available(),
+            "This example requires an Ascend NPU",
+        )
+        try:
+            from memfabric_hybrid import offload
+        except ImportError as exc:
+            raise RuntimeError(f"memfabric_hybrid is unavailable: {exc}") from exc
+
         from sgl_kernel_npu.kvcacheio import TransferDirection
 
         device = torch.device("npu", torch.npu.current_device())
@@ -169,7 +170,7 @@ class TestNPUKVExchangeCopy128KPrefix90(unittest.TestCase):
         track_pinned_staging(pinned_meta)
 
         ret = offload.kv_exchange_copy(meta, device)
-        self.assertEqual(ret, 0)
+        _require(ret == 0, f"offload.kv_exchange_copy failed with code {ret}")
         torch.npu.synchronize()
 
         # Sample the beginning, middle and end of the 90% prefix. Comparing
@@ -180,21 +181,33 @@ class TestNPUKVExchangeCopy128KPrefix90(unittest.TestCase):
         )
         for layer, expected in ((0, 0x11), (1, 0x22)):
             actual = device_k[layer, sampled_pages].view(torch.uint8)
-            self.assertTrue(torch.all(actual == expected).item())
+            _require(
+                torch.all(actual == expected).item(),
+                f"packed KV validation failed for layer {layer}",
+            )
         for layer, expected in ((0, 0x33), (1, 0x44)):
             actual = device_index_k[layer, sampled_pages].view(torch.uint8)
-            self.assertTrue(torch.all(actual == expected).item())
-        self.assertTrue(
-            torch.all(device_index_scale[0, sampled_pages] == 1.25).item()
+            _require(
+                torch.all(actual == expected).item(),
+                f"Indexer K validation failed for layer {layer}",
+            )
+        _require(
+            torch.all(device_index_scale[0, sampled_pages] == 1.25).item(),
+            "Indexer scale validation failed for layer 0",
         )
-        self.assertTrue(
-            torch.all(device_index_scale[1, sampled_pages] == 2.5).item()
+        _require(
+            torch.all(device_index_scale[1, sampled_pages] == 2.5).item(),
+            "Indexer scale validation failed for layer 1",
         )
 
         # Pages not listed in device_indices must remain untouched.
-        self.assertTrue(torch.all(device_k[:, 0].view(torch.uint8) == 0).item())
-        self.assertTrue(
-            torch.all(device_k[:, -1].view(torch.uint8) == 0).item()
+        _require(
+            torch.all(device_k[:, 0].view(torch.uint8) == 0).item(),
+            "Leading guard page was unexpectedly modified",
+        )
+        _require(
+            torch.all(device_k[:, -1].view(torch.uint8) == 0).item(),
+            "Trailing guard page was unexpectedly modified",
         )
 
         transferred_bytes = PREFIX_TOKENS * (
@@ -212,4 +225,4 @@ class TestNPUKVExchangeCopy128KPrefix90(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    main()
