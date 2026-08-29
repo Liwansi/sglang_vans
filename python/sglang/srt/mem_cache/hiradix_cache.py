@@ -1228,6 +1228,21 @@ class HiRadixCache(RadixCache):
         if p is not self.root_node and all(c.evicted for c in p.children.values()):
             heapq.heappush(heap, (self.eviction_strategy.get_priority(p), p))
 
+    def _free_evicted_segments(self, segments: List[torch.Tensor]) -> None:
+        """Free evicted device slots in one fixed-shape call, no torch.unique.
+
+        Every radix node value is whole, contiguous pages, so concatenating
+        them yields one page-aligned token range and free_segment applies:
+        page representatives are a stride slice -- fixed shapes, no
+        data-dependent dedup, no D2H sync on NPU (where free() runs
+        torch.unique on CPU over the full token range, e.g. ~10 chunks of a
+        chunked-prefilled request used to mean 10 uniques per eviction).
+        Allocators without the paged fast path fall back to plain free()
+        via the base free_segment default -- still a single batched call.
+        """
+        allocator = self.cache_controller.mem_pool_device_allocator
+        allocator.free_segment(torch.cat(segments), start_pos=0)
+
     def _evict_write_through(self, num_tokens: int) -> int:
         """write_through / write_through_selective: drop non-backuped leaves,
         demote already-backuped ones. Nothing is staged to host during eviction,
@@ -1235,10 +1250,9 @@ class HiRadixCache(RadixCache):
         """
         heap = self._make_eviction_heap()
         num_evicted = 0
-        # Device slots are collected and freed once after the walk: one
-        # allocator free per pass instead of one per node (each free runs
-        # torch.unique + a D2H sync on NPU). Node values hold disjoint
-        # pages, so the batched free frees exactly the same page set.
+        # Device slots are collected and freed once after the walk. Node
+        # values hold disjoint whole pages, so the batched free releases
+        # exactly the same page set as per-node freeing.
         pending_frees: List[torch.Tensor] = []
         while num_evicted < num_tokens and heap:
             _, x = heapq.heappop(heap)
@@ -1250,7 +1264,7 @@ class HiRadixCache(RadixCache):
                 num_evicted += self._evict_regular(x, pending_frees)
             self._promote_parent(x, heap)
         if pending_frees:
-            self.cache_controller.evict_device(torch.cat(pending_frees))
+            self._free_evicted_segments(pending_frees)
         return num_evicted
 
     def _evict_write_back(self, num_tokens: int) -> int:
@@ -1261,7 +1275,8 @@ class HiRadixCache(RadixCache):
         num_evicted = 0
         staged: List[Tuple[TreeNode, torch.Tensor]] = []
         # Same batching as _evict_write_through: collect device slots and
-        # free them once at the end. Nothing inside the walk (write_backup /
+        # free them once at the end via _free_evicted_segments (no
+        # torch.unique). Nothing inside the walk (write_backup /
         # writing_check / evict_host) reads the device allocator state, so
         # deferring the free until after the walk is externally equivalent.
         pending_frees: List[torch.Tensor] = []
@@ -1291,7 +1306,7 @@ class HiRadixCache(RadixCache):
             self._promote_parent(x, heap)
         flush_staged()
         if pending_frees:
-            self.cache_controller.evict_device(torch.cat(pending_frees))
+            self._free_evicted_segments(pending_frees)
         return num_evicted
 
     def _detach_backuped(self, node: TreeNode) -> int:
