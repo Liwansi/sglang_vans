@@ -619,7 +619,10 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         pinned_meta = torch.tensor(vals, dtype=torch.int64, pin_memory=True)
         meta = torch.empty(pinned_meta.shape, dtype=torch.int64, device=device)
         meta.copy_(pinned_meta, non_blocking=True)
-        track_pinned_staging(pinned_meta)
+
+        if direction_value == TransferDirection.D2H.value:
+            track_pinned_staging(pinned_meta)
+            
         ret = offload.kv_exchange_copy(meta, device)
         if ret != 0:
             raise RuntimeError(f"offload.kv_exchange_copy failed with code {ret}")

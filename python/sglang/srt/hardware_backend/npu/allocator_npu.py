@@ -25,6 +25,11 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
     ):
         super().__init__(size, page_size, dtype, device, kvcache, need_sort)
         self.roundup = page_size - 1
+        # Scratch for the fused free() kernel (unique + cat in one Triton
+        # launch): [cnt, done, seen(num_pages + 1)]
+        self._free_scratch = torch.zeros(
+            self.num_pages + 3, dtype=torch.int32, device=device
+        )
 
     def alloc_extend(
         self,
@@ -155,11 +160,24 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             return
 
         if self.is_not_in_free_group:
-            free_page_indices = torch.unique(free_index // self.page_size)
+            from sglang.kernels.ops.memory.allocator_npu import (
+                free_pages_unique_cat_npu,
+            )
+
             if self.need_sort:
-                self.release_pages = torch.cat((free_page_indices, self.release_pages))
+                self.release_pages = free_pages_unique_cat_npu(
+                    free_index=free_index,
+                    old_pages=self.release_pages,
+                    page_size=self.page_size,
+                    scratch=self._free_scratch,
+                )
             else:
-                self.free_pages = torch.cat((free_page_indices, self.free_pages))
+                self.free_pages = free_pages_unique_cat_npu(
+                    free_index=free_index,
+                    old_pages=self.free_pages,
+                    page_size=self.page_size,
+                    scratch=self._free_scratch,
+                )
         else:
             self.free_group.append(self._copy_for_free_group(free_index))
 
