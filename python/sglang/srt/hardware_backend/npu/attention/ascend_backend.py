@@ -1066,6 +1066,7 @@ class AscendAttnBackend(AttentionBackend):
         self, topk_indices: torch.Tensor, num_tokens: int
     ) -> torch.Tensor:
         current_tokens = topk_indices.shape[0]
+        rank = torch.distributed.get_rank()
         if current_tokens == num_tokens:
             return topk_indices
 
@@ -1077,7 +1078,7 @@ class AscendAttnBackend(AttentionBackend):
         pad_size = num_tokens - current_tokens
         padding = torch.full(
             (pad_size, topk_indices.shape[1]),
-            -1,
+            0,
             dtype=topk_indices.dtype,
             device=topk_indices.device,
         )
@@ -1457,7 +1458,8 @@ class AscendAttnBackend(AttentionBackend):
         mask = new_qlens > 0
 
         rank_seq_qlen = torch.cumsum(new_qlens[mask], dim=0).to(torch.int32)
-        rank_seq_kvlen = actual_seq_lengths_kv[mask].contiguous()
+        causal_kvlen = (actual_seq_lengths_kv - seq_ends + overlap_end).to(torch.int32)
+        rank_seq_kvlen = causal_kvlen[mask].contiguous()
         rank_block_tables = (
             block_tables[mask].contiguous() if block_tables is not None else None
         )
@@ -1524,11 +1526,13 @@ class AscendAttnBackend(AttentionBackend):
                 rank_qlens.append(qlen)
                 rank_kvlen_indices.append(i)
 
-        if pad_size > 0 and attn_tp_rank == attn_tp_size - 1:
+        real_tokens_in_rank = sum(rank_qlens)
+        rank_pad = tokens_per_rank - real_tokens_in_rank
+        if rank_pad > 0:
             if rank_qlens:
-                rank_qlens[-1] += pad_size
+                rank_qlens[-1] += rank_pad
             else:
-                rank_qlens.append(pad_size)
+                rank_qlens.append(rank_pad)
                 rank_kvlen_indices.append(len(seq_ends) - 1)
 
         rank_seq_qlen_cpu = []
@@ -1537,7 +1541,10 @@ class AscendAttnBackend(AttentionBackend):
             acc += ql
             rank_seq_qlen_cpu.append(acc)
 
-        rank_seq_kvlen_cpu = [actual_seq_kvlen_cpu[i] for i in rank_kvlen_indices]
+        rank_seq_kvlen_cpu = [
+            actual_seq_kvlen_cpu[i] - seq_ends[i] + min(seq_ends[i], end_tok)
+            for i in rank_kvlen_indices
+        ]
 
         self.forward_metadata.a2a_prefill_meta = {
             "num_tokens": num_tokens,
@@ -1574,33 +1581,22 @@ class AscendAttnBackend(AttentionBackend):
             and not forward_batch.forward_mode.is_target_verify()
         )
 
-        if is_prefill:
-            seq_lens_cpu_list = list(forward_batch.extend_seq_lens_cpu)
-            total_tokens = sum(seq_lens_cpu_list)
-            actual_seq_qlen_cpu = []
-            acc = 0
-            for s in seq_lens_cpu_list:
-                acc += s
-                actual_seq_qlen_cpu.append(acc)
-            num_requests = len(seq_lens_cpu_list)
-            seq_lens_cpu_for_overlap = (
-                forward_batch.seq_lens_cpu.tolist()
-                if forward_batch.seq_lens_cpu is not None
-                else seq_lens_cpu_list
-            )
-        elif forward_batch.forward_mode.is_target_verify():
-            spec_tokens_per_req = int(forward_batch.spec_info.draft_token_num)
-            num_requests = forward_batch.seq_lens.shape[0]
-            total_tokens = num_requests * spec_tokens_per_req
-            actual_seq_qlen_cpu = [
-                spec_tokens_per_req * (i + 1) for i in range(num_requests)
-            ]
-            seq_lens_cpu_list = None
-        else:
-            num_requests = forward_batch.seq_lens.shape[0]
-            total_tokens = num_requests
-            actual_seq_qlen_cpu = [i + 1 for i in range(num_requests)]
-            seq_lens_cpu_list = None
+        if not is_prefill:
+            return
+
+        seq_lens_cpu_list = list(forward_batch.extend_seq_lens_cpu)
+        total_tokens = sum(seq_lens_cpu_list)
+        actual_seq_qlen_cpu = []
+        acc = 0
+        for s in seq_lens_cpu_list:
+            acc += s
+            actual_seq_qlen_cpu.append(acc)
+        num_requests = len(seq_lens_cpu_list)
+        seq_lens_cpu_for_overlap = (
+            forward_batch.seq_lens_cpu.tolist()
+            if forward_batch.seq_lens_cpu is not None
+            else seq_lens_cpu_list
+        )
 
         if fm.seq_lens_cpu_int is not None:
             actual_seq_kvlen_cpu = fm.seq_lens_cpu_int.clamp(min=1).cpu().tolist()
@@ -1869,6 +1865,27 @@ class AscendAttnBackend(AttentionBackend):
                 )
             )
 
+            if rank_seq_qlen.shape[0] > 0:
+                real_tokens_in_rank = rank_seq_qlen[-1]
+            else:
+                real_tokens_in_rank = 0
+            rank_pad = tokens_per_rank - real_tokens_in_rank
+            if rank_pad > 0:
+                if rank_seq_qlen.shape[0] > 0:
+                    rank_seq_qlen[-1] = rank_seq_qlen[-1] + rank_pad
+                else:
+                    rank_seq_qlen = torch.tensor(
+                        [tokens_per_rank], dtype=torch.int32, device=self.device
+                    )
+                    rank_seq_kvlen = actual_seq_lengths_kv[-1:].to(
+                        device=self.device, dtype=torch.int32
+                    ).contiguous()
+                    rank_block_tables = (
+                        self.forward_metadata.block_tables[-1:].contiguous()
+                        if self.forward_metadata.block_tables is not None
+                        else None
+                    )
+
         if pad_size > 0:
             q = torch.cat(
                 [
@@ -1893,7 +1910,6 @@ class AscendAttnBackend(AttentionBackend):
         q = self._a2a_q(q, attn_tp_size)
 
         topk_indices = topk_indices[start_tok : start_tok + tokens_per_rank]
-
         attn_out = torch_npu.npu_kv_quant_sparse_flash_attention(
             query=q,
             key=k,
@@ -1922,6 +1938,7 @@ class AscendAttnBackend(AttentionBackend):
 
         if self.q_head_num_padding is not None and self.q_head_num_padding > orig_num_heads:
             attn_out = attn_out[:, :orig_num_heads, :]
+
         return attn_out
 
     def _forward_sparse_attn_tp_a2a_decode(
@@ -2009,7 +2026,7 @@ class AscendAttnBackend(AttentionBackend):
                     topk_indices,
                     torch.full(
                         (pad_t, K_sparse),
-                        -1,
+                        0,
                         dtype=topk_indices.dtype,
                         device=topk_indices.device,
                     ),
@@ -2102,14 +2119,14 @@ class AscendAttnBackend(AttentionBackend):
         )
         if k_nope.dtype == torch.uint8:
             k_nope = k_nope.view(torch.float8_e4m3fn)
-
+        k = k_nope.view(-1, self.page_size, 1, packed_cache_dim)
         # ============================================================
         # Kernel call: full heads on T_local tokens
         # ============================================================
         attn_out_local = torch_npu.npu_kv_quant_sparse_flash_attention(
             query=q_local.contiguous(),
-            key=k_nope.view(-1, self.page_size, 1, packed_cache_dim),
-            value=k_nope.view(-1, self.page_size, 1, packed_cache_dim),
+            key=k,
+            value=k,
             sparse_indices=topk_indices_local.contiguous(),
             scale_value=layer.scaling,
             key_quant_mode=2,
@@ -2468,7 +2485,6 @@ class AscendAttnBackend(AttentionBackend):
                         ],
                         dim=1,
                     ).contiguous()
-
                 attn_out = torch_npu.npu_kv_quant_sparse_flash_attention(
                     query=torch.cat((q_nope, q_pe), dim=-1).contiguous(),
                     key=k_nope.view(

@@ -61,7 +61,7 @@ def _quantize_npu_indexer_activation(x, hadamard, dst_type):
 
 
 class DSANPUIndexerMixin:
-    def _indexer_attn_tp(
+    def _indexer_attn_tp_prefill(
         self,
         q,
         k,
@@ -244,6 +244,205 @@ class DSANPUIndexerMixin:
             device=topk_indices.device,
         )
         attn_tp_all_gather_into_tensor(topk_full, topk_indices.contiguous())
+        return topk_full[:total_tokens]
+
+    def _indexer_attn_tp_decode(
+        self,
+        q,
+        k,
+        fm,
+        actual_seq_lengths_q,
+        actual_seq_lengths_kv,
+        block_table,
+        forward_batch,
+        weights,
+        pool,
+        past_key_states,
+        layer_id,
+    ):
+        attn_tp_size = get_attn_tensor_model_parallel_world_size()
+        q_view = q.view(-1, self.n_heads, self.head_dim)
+        total_tokens = q_view.shape[0]
+        num_requests = actual_seq_lengths_q.shape[0]
+
+        attn_tp_rank = get_attn_tensor_model_parallel_rank()
+        local_bs = (num_requests + attn_tp_size - 1) // attn_tp_size
+        padded_requests = local_bs * attn_tp_size
+        req_start = attn_tp_rank * local_bs
+        req_end = min(req_start + local_bs, num_requests)
+
+        # Pad metadata tensors to padded_requests so every rank can
+        # slice [req_start:req_end] without OOB.  Padding slots reuse
+        # the last real entry — they contribute 0 new Q tokens because
+        # the cumsum does not advance.
+        if padded_requests > num_requests:
+            pad_count = padded_requests - num_requests
+            actual_seq_lengths_q_padded = torch.cat(
+                [
+                    actual_seq_lengths_q,
+                    actual_seq_lengths_q[-1:].expand(pad_count),
+                ]
+            )
+            actual_seq_lengths_kv_padded = torch.cat(
+                [
+                    actual_seq_lengths_kv,
+                    actual_seq_lengths_kv[-1:].expand(pad_count),
+                ]
+            )
+            block_table_padded = torch.cat(
+                [
+                    block_table,
+                    block_table[-1:].expand(
+                        pad_count, *block_table.shape[1:]
+                    ),
+                ]
+            )
+        else:
+            actual_seq_lengths_q_padded = actual_seq_lengths_q
+            actual_seq_lengths_kv_padded = actual_seq_lengths_kv
+            block_table_padded = block_table
+
+        if total_tokens % num_requests == 0:
+            # Uniform Q tokens per request (decode / target_verify).
+            # All offsets are Python ints — graph-safe, no .item().
+            tokens_per_req = total_tokens // num_requests
+            token_start = min(req_start * tokens_per_req, total_tokens)
+            token_end = min(req_end * tokens_per_req, total_tokens)
+            q_cumsum_offset = token_start
+            # Every rank is allocated local_bs requests' worth of
+            # tokens — same on all ranks, so all_gather input sizes
+            # match even when the last rank has fewer real requests.
+            tokens_per_rank = local_bs * tokens_per_req
+            local_tokens = max(0, token_end - token_start)
+            q_local = q_view[token_start:token_end]
+            weights_local = weights[token_start:token_end]
+            actual_seq_lengths_q_local = (
+                actual_seq_lengths_q_padded[req_start: req_start + local_bs]
+                - q_cumsum_offset
+            ).to(torch.int32)
+            actual_seq_lengths_kv_local = actual_seq_lengths_kv_padded[
+                req_start: req_start + local_bs
+            ]
+            block_table_local = block_table_padded[
+                req_start: req_start + local_bs
+            ]
+        else:
+            # Variable-length Q (prefill without CP) — never
+            # graph-captured, so .item() synchronization is safe.
+            token_start = (
+                int(actual_seq_lengths_q_padded[req_start - 1].item())
+                if attn_tp_rank > 0
+                else 0
+            )
+            token_end = int(
+                actual_seq_lengths_q_padded[req_end - 1].item()
+            )
+            q_cumsum_offset = token_start
+            # All ranks must agree on the same per-rank capacity.
+            # Simulate every rank's split (deterministic from the
+            # shared cumsum) and take the max local token count.
+            tokens_per_rank = 0
+            for r in range(attn_tp_size):
+                r_start = r * local_bs
+                r_end = min(r_start + local_bs, num_requests)
+                if r_start >= num_requests:
+                    continue
+                r_ts = (
+                    int(actual_seq_lengths_q_padded[r_start - 1].item())
+                    if r_start > 0
+                    else 0
+                )
+                r_te = int(
+                    actual_seq_lengths_q_padded[r_end - 1].item()
+                )
+                tokens_per_rank = max(tokens_per_rank, r_te - r_ts)
+
+            local_tokens = max(0, token_end - token_start)
+            q_local = q_view[token_start:token_end]
+            weights_local = weights[token_start:token_end]
+            actual_seq_lengths_q_local = (
+                    actual_seq_lengths_q_padded[req_start: req_start + local_bs]
+                    - q_cumsum_offset
+            ).to(torch.int32)
+            actual_seq_lengths_kv_local = actual_seq_lengths_kv_padded[
+                                          req_start: req_start + local_bs
+                                          ]
+            block_table_local = block_table_padded[
+                                req_start: req_start + local_bs
+                                ]
+
+        use_quant_indexer = pool.index_k_scale_buffer is not None
+        if use_quant_indexer and local_tokens > 0:
+            query_local, query_scale_local = _quantize_npu_indexer_activation(
+                q_local,
+                pool.indexer_hadamard_128,
+                pool.dtype,
+            )
+            topk_indices = torch_npu.npu_quant_lightning_indexer(
+                query=query_local,
+                key=past_key_states,
+                weights=weights_local,
+                query_dequant_scale=query_scale_local,
+                key_dequant_scale=pool.get_index_k_scale_buffer(layer_id),
+                actual_seq_lengths_query=actual_seq_lengths_q_local,
+                actual_seq_lengths_key=actual_seq_lengths_kv_local.to(
+                    device=k.device, dtype=torch.int32
+                ),
+                block_table=block_table_local,
+                layout_query="TND",
+                layout_key="PA_BSND",
+                sparse_count=self.index_topk,
+                sparse_mode=3,
+                query_quant_mode=0,
+                key_quant_mode=0,
+            )
+            topk_indices = topk_indices.squeeze(1)
+        elif not use_quant_indexer and local_tokens > 0:
+            topk_indices = torch_npu.npu_lightning_indexer(
+                query=q_local,
+                key=past_key_states,
+                weights=weights_local,
+                actual_seq_lengths_query=actual_seq_lengths_q_local,
+                actual_seq_lengths_key=actual_seq_lengths_kv_local.to(
+                    k.device
+                ).to(torch.int32),
+                block_table=block_table_local,
+                layout_query="TND",
+                layout_key="PA_BSND",
+                sparse_count=self.index_topk,
+                sparse_mode=3,
+            )
+            # Keep DSA top-k as [T, K]; NPU attention expands it when needed.
+            topk_indices = topk_indices[0].squeeze(1)
+        else:
+            # This rank has zero real tokens (all padding slots).
+            # Produce a dummy result that will be discarded after trim.
+            topk_indices = torch.empty(
+                (0, self.index_topk),
+                dtype=torch.int32,
+                device=k.device,
+            )
+
+        # All ranks must contribute equal-length chunks to
+        # all_gather_into_tensor.  Pad each rank's output to the
+        # agreed tokens_per_rank, all-gather, then trim.
+        topk_k = topk_indices.shape[-1]
+        if local_tokens < tokens_per_rank:
+            pad = torch.full(
+                (tokens_per_rank - local_tokens, topk_k),
+                -1,
+                dtype=topk_indices.dtype,
+                device=topk_indices.device,
+            )
+            topk_indices = torch.cat([topk_indices, pad], dim=0)
+        topk_full = torch.empty(
+            (tokens_per_rank * attn_tp_size, topk_k),
+            dtype=topk_indices.dtype,
+            device=topk_indices.device,
+        )
+        attn_tp_all_gather_into_tensor(
+            topk_full, topk_indices.contiguous()
+        )
         return topk_full[:total_tokens]
 
     def forward_npu(
@@ -549,8 +748,22 @@ class DSANPUIndexerMixin:
                 envs.SGLANG_NPU_INDEXER_TP.get()
                 and get_parallel().attn_tp_size > 1
             )
-            if use_indexer_tp:
-                return self._indexer_attn_tp(
+            if use_indexer_tp and is_prefill:
+                return self._indexer_attn_tp_prefill(
+                    q,
+                    k,
+                    fm,
+                    actual_seq_lengths_q,
+                    actual_seq_lengths_kv,
+                    block_table,
+                    forward_batch,
+                    weights,
+                    pool,
+                    past_key_states,
+                    layer_id,
+                )
+            elif use_indexer_tp and not is_prefill:
+                return self._indexer_attn_tp_decode(
                     q,
                     k,
                     fm,
