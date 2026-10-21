@@ -47,6 +47,13 @@ def is_sparsity_driven_kv_offload_enabled(
     return True
 
 
+def is_gva_kv_pool_enabled() -> bool:
+    """Return True when the host KV pool should use GVA instead of SHM."""
+    if not envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get():
+        return False
+    return envs.SGLANG_NPU_USE_GVA_KV_POOL.get()
+
+
 def get_sparsity_driven_kv_offload_sparse_context_len(
     *,
     model_config: ModelConfig,

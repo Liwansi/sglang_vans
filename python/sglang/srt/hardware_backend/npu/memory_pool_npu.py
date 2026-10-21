@@ -904,8 +904,55 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         )
 
     def _get_disagg_buffer_entries(self):
-        """Return (buffer, uses_global_slots) entries in PD transfer order."""
-        self._raise_if_native_kv_cache_disabled()
+        """Return (buffer, uses_global_slots) entries in PD transfer order.
+
+        When sparse KV offload with GVA is enabled, ``k_buffer``/``v_buffer``
+        are ``None`` (no device KV).  The main KV lives in the GVA shared
+        DRAM pool managed by ``SparseKVCacheManager``.  The GVA pool uses a
+        **paged** layout matching the prefill side's ``k_buffer`` /
+        ``v_buffer``::
+
+            k_buffer[layer]: [num_blocks, page_size, 1, kv_cache_dim]
+            v_buffer[layer]: [num_blocks, page_size, 1, v_cache_dim]
+
+        The flat ``host_kv_buffer`` list follows the same entry order as
+        the normal path: [k_0..k_{L-1}, v_0..v_{L-1}], enabling direct
+        page-to-page D2RH transfer.
+        """
+        if self.k_buffer is None or self.v_buffer is None:
+            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+                is_gva_kv_pool_enabled,
+            )
+
+            if is_gva_kv_pool_enabled():
+                from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager import (
+                    get_sparse_kv_manager,
+                )
+
+                sparse_mgr = get_sparse_kv_manager()
+                if (
+                    sparse_mgr is not None
+                    and getattr(sparse_mgr, "_gva_pool", None) is not None
+                ):
+                    gva_pool = sparse_mgr._gva_pool
+                    # Paged K+V entries from GVA host pool (TP-shared → global)
+                    entries = [
+                        (buf, True) for buf in gva_pool.host_kv_buffer
+                    ]
+                    # Indexer entries from HBM (always global slots)
+                    if self.index_k_buffer is not None:
+                        entries += [
+                            (buf, True) for buf in self.index_k_buffer
+                        ]
+                        if self.index_k_scale_buffer is not None:
+                            entries += [
+                                (buf, True)
+                                for buf in self.index_k_scale_buffer
+                            ]
+                    return entries
+            # Fall through to raise if GVA not enabled
+            self._raise_if_native_kv_cache_disabled()
+
         global_kv = self.is_draft_worker
         entries = [(buffer, global_kv) for buffer in self.k_buffer]
         if not getattr(self, "dsa_kv_cache_store_fp8", False):

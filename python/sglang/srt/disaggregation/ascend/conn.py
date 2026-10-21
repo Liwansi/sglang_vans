@@ -281,6 +281,22 @@ class AscendKVManager(MooncakeKVManager):
         dst_kv_item_len: Optional[int] = None,
         dst_attn_tp_size: Optional[int] = None,
     ):
+        # -- D2RH dispatch -------------------------------------------------
+        # When the *destination* (decode side) uses a GVA shared DRAM pool,
+        # the dst_kv_ptrs list is a mix of GVA DRAM addresses (main KV) and
+        # HBM addresses (indexer).  Route through the dedicated D2RH path
+        # which uses batch_transfer_sync_write and coalesces descriptors
+        # across both media types in a single batch.
+        if self._is_d2rh_destination(dst_kv_ptrs):
+            return self.send_kvcache_d2rh(
+                mooncake_session_id=mooncake_session_id,
+                prefill_kv_indices=prefill_kv_indices,
+                dst_kv_ptrs=dst_kv_ptrs,
+                dst_kv_indices=dst_kv_indices,
+                executor=executor,
+                dst_layer_ids=dst_layer_ids,
+            )
+
         if dst_device_kv_indices is not None:
             raise NotImplementedError(
                 "Ascend PD transfer does not support HiSparse "
@@ -403,6 +419,118 @@ class AscendKVManager(MooncakeKVManager):
             return process_layers(layers_params)
 
         return 0
+
+    # ------------------------------------------------------------------
+    # D2RH (Device-to-Remote-Host) push path
+    # ------------------------------------------------------------------
+    _D2RH_GVA_THRESHOLD = 1 << 40  # 1 TiB — GVA addresses are high VA
+
+    def _is_d2rh_destination(self, dst_kv_ptrs: list[int]) -> bool:
+        """Heuristic: detect whether the decode side registered a GVA pool.
+
+        GVA virtual addresses are typically in the high address space
+        (above 1 TiB on 64-bit Linux).  If the first destination pointer
+        exceeds this threshold, we assume the D side is using a GVA shared
+        DRAM pool and route through the D2RH send path.
+        """
+        if not dst_kv_ptrs:
+            return False
+        return bool(dst_kv_ptrs[0] >= self._D2RH_GVA_THRESHOLD)
+
+    @staticmethod
+    def _coalesce_descriptors(
+        descriptors: List[Tuple[int, int, int]],
+    ) -> List[Tuple[int, int, int]]:
+        """Merge contiguous (src, dst, len) segments for fewer RDMA ops."""
+        if not descriptors:
+            return []
+        merged = [list(descriptors[0])]
+        for src, dst, length in descriptors[1:]:
+            last = merged[-1]
+            if (
+                last[0] + last[2] == src
+                and last[1] + last[2] == dst
+            ):
+                last[2] += length
+            else:
+                merged.append([src, dst, length])
+        return [tuple(m) for m in merged]
+
+    def send_kvcache_d2rh(
+        self,
+        mooncake_session_id: str,
+        prefill_kv_indices: npt.NDArray[np.int32],
+        dst_kv_ptrs: list[int],
+        dst_kv_indices: npt.NDArray[np.int32],
+        executor: concurrent.futures.ThreadPoolExecutor,
+        dst_layer_ids: Optional[List[int]] = None,
+    ) -> int:
+        """D2RH push: main KV → D GVA DRAM, indexer → D HBM in one batch.
+
+        Mirrors ``test_transfer_engine_d2rh_shared.py``: build a flat
+        descriptor list mixing DRAM-bound and HBM-bound entries, coalesce
+        contiguous segments, then issue a single
+        ``batch_transfer_sync_write``.
+
+        The source layout (P side) is the standard paged KV cache:
+        ``kv_data_ptrs[layer]`` with ``kv_item_lens[layer]`` bytes per page.
+        The destination layout (D side) is:
+        * main KV layers → GVA host pool (DRAM), item_len = per-request bytes
+        * indexer layers → HBM hot pool (VRAM), item_len = per-page bytes
+
+        Because the GVA pool is per-request while P's source is per-page,
+        the main-KV descriptors use the full request slot as the transfer
+        unit (``item_len = kv_item_lens[layer]`` which equals
+        ``max_context_len * head_num * head_dim * dtype_size``).  The
+        ``prefill_kv_indices`` / ``dst_kv_indices`` are treated as request
+        indices for main-KV layers and page indices for indexer layers.
+        """
+        num_src_entries = len(self.kv_args.kv_data_ptrs)
+        num_dst_entries = len(dst_kv_ptrs)
+        if num_src_entries != num_dst_entries:
+            raise RuntimeError(
+                f"D2RH entry count mismatch: src={num_src_entries} "
+                f"dst={num_dst_entries}"
+            )
+
+        # Group contiguous source/destination indices
+        src_blocks, dst_blocks = group_concurrent_contiguous(
+            prefill_kv_indices, dst_kv_indices
+        )
+
+        # Build mixed-media descriptors
+        descriptors: List[Tuple[int, int, int]] = []
+        for layer_id in range(num_src_entries):
+            src_ptr = self.kv_args.kv_data_ptrs[layer_id]
+            dst_ptr = dst_kv_ptrs[layer_id]
+            item_len = self.kv_args.kv_item_lens[layer_id]
+            for src_group, dst_group in zip(src_blocks, dst_blocks):
+                descriptors.append(
+                    (
+                        src_ptr + int(src_group[0]) * item_len,
+                        dst_ptr + int(dst_group[0]) * item_len,
+                        len(src_group) * item_len,
+                    )
+                )
+
+        descriptors = self._coalesce_descriptors(descriptors)
+        if not descriptors:
+            return 0
+
+        src_addrs = [d[0] for d in descriptors]
+        dst_addrs = [d[1] for d in descriptors]
+        lengths = [d[2] for d in descriptors]
+
+        logger.debug(
+            "D2RH push: session=%s descriptors=%d total_bytes=%d",
+            mooncake_session_id,
+            len(descriptors),
+            sum(lengths),
+        )
+
+        return self.engine.batch_transfer_sync_write(
+            mooncake_session_id, src_addrs, dst_addrs, lengths
+        )
 
     def send_kvcache_dcp(
         self,

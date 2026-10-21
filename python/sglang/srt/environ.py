@@ -1054,6 +1054,11 @@ class Envs:
     # Set to 0 to restore the separate SiTU + npu_dynamic_mx_quant path.
     SGLANG_NPU_MOE_SITU_MXFP8_FUSED = EnvBool(True)
     SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD = EnvBool(False)
+    # Use memfabric_hybrid GVA (Global Virtual Address) for the host KV pool
+    # instead of create_shm_tensor.  Only TP rank 0 allocates physical DRAM;
+    # all TP ranks share the same virtual address via IOMMU mapping.
+    # Per-DP-group isolation uses store_port = 8500 + dp_index.
+    SGLANG_NPU_USE_GVA_KV_POOL = EnvBool(False)
     # Use FIAS V2 for DSpark MLA target verify and MHA draft paths. Graph
     # replay requires torch_npu's V2 handler to update actual_seq_kvlen.
     SGLANG_NPU_USE_FIAS_V2_BSND = EnvBool(False)

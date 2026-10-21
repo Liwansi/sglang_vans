@@ -13,6 +13,9 @@ from sgl_kernel_npu.sparsity_driven_kv_offload import (
 )
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+    is_gva_kv_pool_enabled,
+)
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
@@ -182,19 +185,43 @@ class SparseKVCacheManager:
         logger.info("Sparse KV host buffer shape: %s", host_kv_shape)
         device_id = torch.npu.current_device()
 
-        try:
-            for layer_idx in range(self.layer_num):
-                shm_cpu_tensor, host_ptr, dev_ptr = create_shm_tensor(
-                    shape=host_kv_shape,
-                    dtype=self.store_dtype,
+        if is_gva_kv_pool_enabled():
+            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.gva_pool import (
+                GVAKVPoolManager,
+            )
+
+            try:
+                paged_kv = self.paged_kv_cache
+                self._gva_pool = GVAKVPoolManager(
+                    size=self.size,
+                    max_context_len=self.max_context_len,
+                    page_size=paged_kv.page_size,
+                    kv_cache_dim=paged_kv.kv_cache_dim,
+                    v_cache_dim=paged_kv.kr_cache_dim,
+                    layer_num=self.layer_num,
+                    store_dtype=self.store_dtype,
                     device_id=device_id,
-                    name=f"host_kv_layer_{layer_idx}_rank_{device_id}",
                 )
-                self.host_kv_buffer.append(shm_cpu_tensor)
-                self.host_ptr_list.append(host_ptr)
-                self.dev_ptr_list.append(dev_ptr)
-        except Exception as e:
-            self._raise_buffer_allocation_error("host_kv_buffer", e)
+                self.host_kv_buffer = self._gva_pool.host_kv_buffer
+                self.host_ptr_list = self._gva_pool.host_ptr_list
+                self.dev_ptr_list = self._gva_pool.dev_ptr_list
+            except Exception as e:
+                self._raise_buffer_allocation_error("host_kv_buffer (GVA)", e)
+        else:
+            self._gva_pool = None
+            try:
+                for layer_idx in range(self.layer_num):
+                    shm_cpu_tensor, host_ptr, dev_ptr = create_shm_tensor(
+                        shape=host_kv_shape,
+                        dtype=self.store_dtype,
+                        device_id=device_id,
+                        name=f"host_kv_layer_{layer_idx}_rank_{device_id}",
+                    )
+                    self.host_kv_buffer.append(shm_cpu_tensor)
+                    self.host_ptr_list.append(host_ptr)
+                    self.dev_ptr_list.append(dev_ptr)
+            except Exception as e:
+                self._raise_buffer_allocation_error("host_kv_buffer", e)
         self.host_kv_ctx_len = torch.zeros(
             (self.size, self.max_context_len), dtype=torch.int32, device="cpu"
         )
