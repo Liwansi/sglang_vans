@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import time
 from array import array
 from collections import deque
@@ -1698,6 +1699,46 @@ class SchedulerDisaggregationPrefillMixin:
         # already put the request on `disagg_prefill_inflight_queue`.
         if last_chunk:
             self.disagg_prefill_pending_chunk_rids.discard(req.rid)
+
+            if os.getenv("SGLANG_D2RH_VERIFY"):
+                import torch as _torch
+                _vdir = os.getenv("SGLANG_D2RH_VERIFY_DIR", "/tmp/d2rh_verify")
+                os.makedirs(_vdir, exist_ok=True)
+                _vlayers = int(os.getenv("SGLANG_D2RH_VERIFY_LAYERS", "4"))
+                _seq_len = min(req.extend_end, len(req.origin_input_ids))
+                _raw = self.req_to_token_pool.req_to_token[
+                    req.kv.req_pool_idx, :_seq_len
+                ]
+                _phys = (
+                    self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
+                        _raw
+                    )
+                )
+                _all_pages = kv_to_page_indices(_phys, page_size)
+                _pool = self.token_to_kv_pool
+                np.save(f"{_vdir}/prefill_{req.rid}_pages.npy", _all_pages)
+                _k_bufs = _pool.k_buffer
+                for _lid in range(min(_vlayers, len(_k_bufs))):
+                    if _k_bufs[_lid] is not None:
+                        _torch.save(
+                            _k_bufs[_lid][_all_pages].cpu().clone(),
+                            f"{_vdir}/prefill_{req.rid}_k_L{_lid}.pt",
+                        )
+                _v_bufs = getattr(_pool, "v_buffer", None)
+                if _v_bufs:
+                    for _lid in range(min(_vlayers, len(_v_bufs))):
+                        if _v_bufs[_lid] is not None:
+                            _torch.save(
+                                _v_bufs[_lid][_all_pages].cpu().clone(),
+                                f"{_vdir}/prefill_{req.rid}_v_L{_lid}.pt",
+                            )
+                logger.info(
+                    "D2RH VERIFY [P]: saved rid=%s seq_len=%d pages=%d layers=0-%d",
+                    req.rid,
+                    _seq_len,
+                    len(_all_pages),
+                    min(_vlayers, len(_k_bufs)) - 1,
+                )
         else:
             self.disagg_prefill_pending_chunk_rids.add(req.rid)
 
