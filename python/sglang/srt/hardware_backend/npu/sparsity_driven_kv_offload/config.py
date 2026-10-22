@@ -54,6 +54,11 @@ def is_gva_kv_pool_enabled() -> bool:
     return envs.SGLANG_NPU_USE_GVA_KV_POOL.get()
 
 
+def get_gva_dram_size_gb() -> int:
+    """Return the DRAM budget (in GiB) for the GVA shared KV pool."""
+    return int(envs.SGLANG_NPU_GVA_DRAM_SIZE_GB.get())
+
+
 def get_sparsity_driven_kv_offload_sparse_context_len(
     *,
     model_config: ModelConfig,

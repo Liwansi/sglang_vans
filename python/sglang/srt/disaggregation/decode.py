@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import time
 from collections import deque
 from concurrent.futures import Future
@@ -3433,6 +3434,10 @@ class SchedulerDisaggregationDecodeMixin:
             transferred_reqs = (
                 self.disagg_decode_transfer_queue.pop_transferred()
             )  # the requests which kv has arrived
+
+            if os.getenv("SGLANG_D2RH_VERIFY"):
+                self._d2rh_verify(transferred_reqs)
+
             if self.enable_hisparse:
                 for req in transferred_reqs:
                     # Direct-to-host: KV data already in host pool, skip staging
@@ -3442,3 +3447,102 @@ class SchedulerDisaggregationDecodeMixin:
                 # Give completed host transfers device space before new arrivals.
                 req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
                 self.disagg_decode_transfer_queue.extend(req_conns)
+
+    def _d2rh_verify(self, transferred_reqs: List) -> None:
+        """Verify HBM->DRAM transfer: compare prefill snapshot with decode DRAM."""
+        import os as _os
+        import torch as _torch
+
+        _vdir = _os.getenv("SGLANG_D2RH_VERIFY_DIR", "/tmp/d2rh_verify")
+        _vlayers = int(_os.getenv("SGLANG_D2RH_VERIFY_LAYERS", "4"))
+        page_size = self.token_to_kv_pool.page_size
+
+        from sglang.srt.mem_cache.common import kv_to_page_indices
+
+        dram_k = None
+        dram_v = None
+        try:
+            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+                is_gva_kv_pool_enabled,
+            )
+
+            if is_gva_kv_pool_enabled():
+                from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager import (
+                    get_sparse_kv_manager,
+                )
+
+                _smgr = get_sparse_kv_manager()
+                if _smgr is not None and getattr(_smgr, "_gva_pool", None) is not None:
+                    dram_k = _smgr._gva_pool.k_buffer
+                    dram_v = _smgr._gva_pool.v_buffer
+        except Exception:
+            pass
+
+        if dram_k is None and self.enable_hisparse:
+            mp = self.hisparse_coordinator.mem_pool_host
+            dram_k = mp.k_buffer
+            dram_v = getattr(mp, "v_buffer", None)
+
+        if dram_k is None:
+            dram_k = self.token_to_kv_pool.k_buffer
+            dram_v = getattr(self.token_to_kv_pool, "v_buffer", None)
+
+        for req in transferred_reqs:
+            rid = req.rid
+            k0_path = _os.path.join(_vdir, f"prefill_{rid}_k_L0.pt")
+            if not _os.path.exists(k0_path):
+                continue
+
+            seq_len = len(req.origin_input_ids)
+            raw = self.req_to_token_pool.req_to_token[req.kv.req_pool_idx, :seq_len]
+            phys = self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
+                raw
+            )
+            decode_pages = kv_to_page_indices(phys, page_size)
+
+            all_pass = True
+            for lid in range(min(_vlayers, len(dram_k))):
+                path = _os.path.join(_vdir, f"prefill_{rid}_k_L{lid}.pt")
+                if not _os.path.exists(path) or dram_k[lid] is None:
+                    continue
+                prefill_data = _torch.load(path)
+                decode_data = dram_k[lid][decode_pages].clone()
+                if _torch.equal(prefill_data, decode_data):
+                    logger.info("D2RH VERIFY [D]: PASS rid=%s K L%d", rid, lid)
+                else:
+                    all_pass = False
+                    d = (prefill_data.float() - decode_data.float()).abs()
+                    logger.error(
+                        "D2RH VERIFY [D]: FAIL rid=%s K L%d "
+                        "max_diff=%.6e mean_diff=%.6e",
+                        rid,
+                        lid,
+                        d.max().item(),
+                        d.mean().item(),
+                    )
+
+            if dram_v:
+                for lid in range(min(_vlayers, len(dram_v))):
+                    path = _os.path.join(_vdir, f"prefill_{rid}_v_L{lid}.pt")
+                    if not _os.path.exists(path) or dram_v[lid] is None:
+                        continue
+                    prefill_data = _torch.load(path)
+                    decode_data = dram_v[lid][decode_pages].clone()
+                    if _torch.equal(prefill_data, decode_data):
+                        logger.info("D2RH VERIFY [D]: PASS rid=%s V L%d", rid, lid)
+                    else:
+                        all_pass = False
+                        d = (prefill_data.float() - decode_data.float()).abs()
+                        logger.error(
+                            "D2RH VERIFY [D]: FAIL rid=%s V L%d "
+                            "max_diff=%.6e mean_diff=%.6e",
+                            rid,
+                            lid,
+                            d.max().item(),
+                            d.mean().item(),
+                        )
+
+            if all_pass:
+                logger.info("D2RH VERIFY [D]: ALL PASS rid=%s", rid)
+            else:
+                logger.error("D2RH VERIFY [D]: MISMATCH DETECTED rid=%s", rid)

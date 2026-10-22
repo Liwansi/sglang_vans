@@ -140,6 +140,7 @@ class GVAKVPoolManager:
         layer_num: int,
         store_dtype: torch.dtype,
         device_id: int,
+        dram_size_gb: int = 32,
     ) -> None:
         if _offload is None:
             raise ImportError(
@@ -159,9 +160,25 @@ class GVAKVPoolManager:
         self.page_size: int = page_size
         self.store_dtype: torch.dtype = store_dtype
 
-        # Derive number of blocks from total token capacity
-        total_tokens = size * max_context_len
-        self.num_blocks: int = (total_tokens + page_size - 1) // page_size
+        # Derive num_blocks from DRAM budget, NOT from full token capacity.
+        # Per-block bytes = page_size * (kv_cache_dim + v_cache_dim) * dtype_size
+        elem_size = torch.empty((), dtype=store_dtype).element_size()
+        per_block_bytes = page_size * (kv_cache_dim + v_cache_dim) * elem_size
+        dram_budget_bytes = dram_size_gb * (1 << 30)
+        max_blocks_by_budget = dram_budget_bytes // (
+            per_block_bytes * layer_num
+        )
+        # Also cap by the logical maximum (size * max_context_len / page_size)
+        max_blocks_logical = (
+            size * max_context_len + page_size - 1
+        ) // page_size
+        self.num_blocks: int = int(min(max_blocks_by_budget, max_blocks_logical))
+        if self.num_blocks <= 0:
+            raise RuntimeError(
+                f"GVAKVPoolManager DRAM budget too small: {dram_size_gb} GiB "
+                f"cannot fit even 1 block per layer (per_block={per_block_bytes}, "
+                f"layers={layer_num})"
+            )
 
         # Build buffer specs: K per layer, then V per layer (if v_cache_dim > 0)
         self._specs: List[_BufferSpec] = []
@@ -183,11 +200,12 @@ class GVAKVPoolManager:
         dp_index = parallel.dp_rank if parallel.dp_rank is not None else 0
         logger.info(
             "GVAKVPoolManager init: tp_rank=%d tp_size=%d dp_index=%d "
-            "pool=%.2f GiB layers=%d num_blocks=%d page_size=%d "
-            "kv_dim=%d v_dim=%d buffers=%d",
+            "dram_budget=%d GiB pool=%.2f GiB layers=%d num_blocks=%d "
+            "page_size=%d kv_dim=%d v_dim=%d buffers=%d",
             self.tp_rank,
             self.tp_size,
             dp_index,
+            dram_size_gb,
             total_pool_bytes / (1 << 30),
             layer_num,
             self.num_blocks,
