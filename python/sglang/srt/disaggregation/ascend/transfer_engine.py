@@ -92,31 +92,6 @@ class AscendTransferEngine(MooncakeTransferEngine):
         if ret_value != 0:
             logger.debug(f"Ascend memory registration for ptr {ptrs} failed.")
 
-    def batch_transfer_sync_write(
-        self,
-        session_id: str,
-        src_ptrs: List[int],
-        dst_ptrs: List[int],
-        lengths: List[int],
-    ) -> int:
-        """Push-mode batch transfer: write local source buffers to remote
-        destinations registered under *session_id*.
-
-        Used by the D2RH path where Prefill pushes main KV to Decode's GVA
-        DRAM pool and indexer to Decode's HBM in a single batch.  Falls back
-        to ``batch_transfer_sync`` when the memfabric build does not expose
-        the explicit write API.
-        """
-        write_fn = getattr(self.engine, "batch_transfer_sync_write", None)
-        if write_fn is not None:
-            try:
-                return write_fn(session_id, src_ptrs, dst_ptrs, lengths)
-            except Exception:
-                return -1
-        return self.engine.batch_transfer_sync(
-            session_id, src_ptrs, dst_ptrs, lengths
-        )
-
     @staticmethod
     def _get_transfer_protocol() -> str:
         protocol = os.getenv("ASCEND_MF_TRANSFER_PROTOCOL")

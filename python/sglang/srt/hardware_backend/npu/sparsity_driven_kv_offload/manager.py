@@ -436,20 +436,6 @@ class SparseKVCacheManager:
 
         # k:         [num_new_tokens, nhead, kv_lora_rank]
         # k_rope:    [num_new_tokens, nhead, qk_rope_head_dim]
-
-        # -- GVA paged path: K and V go to separate paged buffers ---------
-        # host_kv_buffer layout is [num_blocks, page_size, 1, dim].
-        # Destination index = out_cache_loc (page slot), not per-request.
-        if (
-            is_gva_kv_pool_enabled()
-            and getattr(self, "_gva_pool", None) is not None
-        ):
-            self._offload_v2_paged(k, k_rope, layer_idx, forward_batch, stream)
-            return
-
-        # -- SHM per-request path (original) ------------------------------
-        # host_kv_buffer layout is [num_reqs, max_ctx_len, nhead, kv_dim].
-        # K and V are concatenated and written as one fused tensor.
         src_tensor = torch.cat([k, k_rope], dim=-1).contiguous()
         dst_tensor = self.host_kv_buffer[layer_idx]
         src_index = torch.arange(src_tensor.shape[0], device=device, dtype=torch.long)
@@ -615,79 +601,6 @@ class SparseKVCacheManager:
                 block_dim=48,
                 dst_ptr=self.dev_ptr_list[layer_idx],
             )
-
-    def _offload_v2_paged(
-        self,
-        k: torch.Tensor,
-        k_rope: torch.Tensor,
-        layer_idx: int,
-        forward_batch: ForwardBatch,
-        stream: torch.npu.Stream,
-    ):
-        """GVA paged offload: write K and V to separate paged host buffers.
-
-        Destination index is the page slot (``out_cache_loc``), matching the
-        paged layout ``[num_blocks, page_size, 1, dim]``.  K and V are written
-        independently because they live in separate buffers.
-        """
-        device = k.device
-        num_new_tokens = int(k.shape[0])
-        src_index = torch.arange(
-            num_new_tokens, device=device, dtype=torch.long
-        )
-
-        # Paged destination: out_cache_loc is the flat page slot index.
-        cache_loc = forward_batch.out_cache_loc.to(torch.long)
-        if int(cache_loc.shape[0]) != num_new_tokens:
-            raise RuntimeError(
-                "GVA paged offload expects out_cache_loc rows to match "
-                f"compact KV rows, got {int(cache_loc.shape[0])} and "
-                f"{num_new_tokens}."
-            )
-
-        valid_mask = (cache_loc >= 0).contiguous()
-        dst_index = cache_loc.contiguous()
-
-        k_buffer = self._gva_pool.k_buffer[layer_idx]
-        v_buffer = (
-            self._gva_pool.v_buffer[layer_idx]
-            if self._gva_pool.v_buffer
-            else None
-        )
-        k_dev_ptr = self._gva_pool.dev_ptr_list[layer_idx]
-        v_dev_ptr = (
-            self._gva_pool.dev_ptr_list[layer_idx + self.layer_num]
-            if v_buffer is not None
-            else None
-        )
-
-        actual_stream = (
-            stream if stream is not None else torch.npu.current_stream()
-        )
-        with torch.npu.stream(actual_stream):
-            unidex_copy_inplace(
-                k,
-                k_buffer,
-                src_index,
-                dst_index,
-                valid_mask,
-                1,  # k: [num_new_tokens, nhead, kv_lora_rank]
-                1,  # k_buffer: [num_blocks, page_size, 1, kv_lora_rank]
-                block_dim=48,
-                dst_ptr=k_dev_ptr,
-            )
-            if v_buffer is not None:
-                unidex_copy_inplace(
-                    k_rope,
-                    v_buffer,
-                    src_index,
-                    dst_index,
-                    valid_mask,
-                    1,  # k_rope: [num_new_tokens, nhead, qk_rope_head_dim]
-                    1,  # v_buffer: [num_blocks, page_size, 1, qk_rope_head_dim]
-                    block_dim=48,
-                    dst_ptr=v_dev_ptr,
-                )
 
     def get_forward_kv(
         self,
