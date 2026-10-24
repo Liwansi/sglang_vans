@@ -152,8 +152,12 @@ class GVAKVPoolManager:
         from sglang.srt.runtime_context import get_parallel
 
         parallel = get_parallel()
-        self.tp_rank: int = parallel.tp_rank
-        self.tp_size: int = parallel.tp_size
+        if getattr(parallel, "attn_dp_enabled", False) and parallel.attn_dp_size > 1:
+            self.tp_rank: int = parallel.attn_tp_rank
+            self.tp_size: int = parallel.attn_tp_size
+        else:
+            self.tp_rank: int = parallel.tp_rank
+            self.tp_size: int = parallel.tp_size
         self.tp_group = get_tp_group()
         self.device_id: int = device_id
         self.layer_num: int = layer_num

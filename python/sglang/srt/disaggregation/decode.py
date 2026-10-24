@@ -3436,6 +3436,15 @@ class SchedulerDisaggregationDecodeMixin:
             )  # the requests which kv has arrived
 
             if os.getenv("SGLANG_D2RH_VERIFY"):
+                logger.info(
+                    "D2RH VERIFY [D]: transferred_reqs=%d "
+                    "transfer_queue=%d prealloc_queue=%d",
+                    len(transferred_reqs),
+                    len(self.disagg_decode_transfer_queue),
+                    len(self.disagg_decode_prealloc_queue.queue)
+                    if hasattr(self.disagg_decode_prealloc_queue, "queue")
+                    else -1,
+                )
                 self._d2rh_verify(transferred_reqs)
 
             if self.enable_hisparse:
@@ -3489,7 +3498,21 @@ class SchedulerDisaggregationDecodeMixin:
 
         for req in transferred_reqs:
             rid = req.rid
+            # Skip health-check requests — they have no real KV data and
+            # indexing GVA buffers with their empty/invalid pages segfaults.
+            if isinstance(rid, str) and rid.startswith("HEALTH_CHECK"):
+                continue
             k0_path = _os.path.join(_vdir, f"prefill_{rid}_k_L0.pt")
+            logger.info(
+                "D2RH VERIFY [D]: checking rid=%s k0_path=%s exists=%s "
+                "dram_k=%s dram_v=%s seq_len=%d",
+                rid,
+                k0_path,
+                _os.path.exists(k0_path),
+                type(dram_k).__name__ if dram_k is not None else None,
+                type(dram_v).__name__ if dram_v is not None else None,
+                len(req.origin_input_ids),
+            )
             if not _os.path.exists(k0_path):
                 continue
 
@@ -3499,6 +3522,17 @@ class SchedulerDisaggregationDecodeMixin:
                 raw
             )
             decode_pages = kv_to_page_indices(phys, page_size)
+
+            # Bounds check: GVA pool may have fewer blocks than the full
+            # token capacity.  Skip requests whose pages exceed the pool.
+            max_page = int(decode_pages.max().item()) if len(decode_pages) > 0 else -1
+            num_blocks = len(dram_k[0]) if dram_k is not None and len(dram_k) > 0 else 0
+            if max_page >= num_blocks:
+                logger.warning(
+                    "D2RH VERIFY [D]: SKIP rid=%s max_page=%d >= num_blocks=%d",
+                    rid, max_page, num_blocks,
+                )
+                continue
 
             all_pass = True
             for lid in range(min(_vlayers, len(dram_k))):
@@ -3521,7 +3555,7 @@ class SchedulerDisaggregationDecodeMixin:
                         d.mean().item(),
                     )
 
-            if dram_v:
+            if dram_v is not None:
                 for lid in range(min(_vlayers, len(dram_v))):
                     path = _os.path.join(_vdir, f"prefill_{rid}_v_L{lid}.pt")
                     if not _os.path.exists(path) or dram_v[lid] is None:
