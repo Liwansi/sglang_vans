@@ -598,30 +598,104 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.scheduler.tp_worker.model_runner.kv_cache_dtype_str
         )
         kv_args.kv_layout = get_pd_kv_layout(self.token_to_kv_pool)
-        transfer_kv_pool = (
-            self.scheduler.hisparse_coordinator.mem_pool_host
-            if self.scheduler.enable_hisparse
-            else self.token_to_kv_pool
+
+        # -- GVA D2RH path --------------------------------------------------
+        # When GVA KV pool is enabled, main KV lives in the GVA shared DRAM
+        # pool (registered as DRAM transfer destination) and the indexer
+        # remains in HBM (registered as VRAM destination for D2D).  Both
+        # are registered to the TransferEngine; the engine auto-routes
+        # based on the registered memory kind of each destination address.
+        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+            is_gva_kv_pool_enabled,
         )
-        kv_data_ptrs, kv_data_lens, kv_item_lens = get_kv_transfer_buf_infos(
-            transfer_kv_pool
-        )
-        kv_data_mem_kinds = (
-            ["DRAM"] * len(kv_data_ptrs)
-            if self.scheduler.enable_hisparse
-            else ["VRAM"] * len(kv_data_ptrs)
-        )
-        if self.scheduler.enable_hisparse and isinstance(
-            self.token_to_kv_pool, DeepSeekV4TokenToKVPool
-        ):
-            device_kv_data_ptrs, device_kv_data_lens, device_kv_item_lens = (
-                self.token_to_kv_pool.get_contiguous_buf_infos()
+
+        if is_gva_kv_pool_enabled():
+            # Resolve the manager from this decode KV pool.  Do not use the
+            # process-global registration: multiple DP/model pools can exist
+            # in one process and must not exchange GVA pointers.
+            sparse_mgr = getattr(self.token_to_kv_pool, "sparse_kv_manager", None)
+            if (
+                sparse_mgr is None
+                or getattr(sparse_mgr, "_gva_pool", None) is None
+                or sparse_mgr.paged_kv_cache is not self.token_to_kv_pool
+            ):
+                raise RuntimeError(
+                    "GVA KV pool is enabled but this decode KV pool has no "
+                    "matching SparseKVCacheManager. Ensure the attention "
+                    "backend is initialized before _init_kv_manager()."
+                )
+            gva_pool = sparse_mgr._gva_pool
+            paged_kv = sparse_mgr.paged_kv_cache
+
+            # Main KV: GVA paged host-pool addresses (DRAM).
+            # host_kv_buffer = [k_0..k_{L-1}, v_0..v_{L-1}] matching P side.
+            # buf[0].nbytes = page_size * dim * dtype_size = bytes per page.
+            kv_data_ptrs = list(gva_pool.host_ptr_list)
+            kv_data_lens = [buf.nbytes for buf in gva_pool.host_kv_buffer]
+            kv_item_lens = [buf[0].nbytes for buf in gva_pool.host_kv_buffer]
+            kv_data_mem_kinds = ["DRAM"] * len(kv_data_ptrs)
+            num_main_kv = len(kv_data_ptrs)
+
+            # Indexer K (+ optional scale): HBM (VRAM, D2D)
+            if paged_kv.index_k_buffer is not None:
+                for buf in paged_kv.index_k_buffer:
+                    kv_data_ptrs.append(int(buf.data_ptr()))
+                    kv_data_lens.append(buf.nbytes)
+                    kv_item_lens.append(buf[0].nbytes)
+                kv_data_mem_kinds += ["VRAM"] * len(paged_kv.index_k_buffer)
+                if paged_kv.index_k_scale_buffer is not None:
+                    for buf in paged_kv.index_k_scale_buffer:
+                        kv_data_ptrs.append(int(buf.data_ptr()))
+                        kv_data_lens.append(buf.nbytes)
+                        kv_item_lens.append(buf[0].nbytes)
+                    kv_data_mem_kinds += ["VRAM"] * len(
+                        paged_kv.index_k_scale_buffer
+                    )
+
+            logger.info(
+                "[GVA-D2RH] PD transfer destinations registered: main KV = "
+                "memfabric_hybrid (mf) GVA shared DRAM pool on this decode "
+                "instance, so prefill->decode KV transfer walks D2RH "
+                "(prefill NPU device direct-write into decode host DRAM "
+                "over mf, page-to-page); indexer = decode HBM (device D2D). "
+                "Registered %d main-KV (DRAM, paged %dx%d, gva_base=%#x) + "
+                "%d indexer (VRAM) entries for PD transfer",
+                num_main_kv,
+                gva_pool.num_blocks,
+                gva_pool.page_size,
+                gva_pool.host_ptr_list[0],
+                len(kv_data_ptrs) - num_main_kv,
             )
-            c4_layer_num = self.scheduler.hisparse_coordinator.mem_pool_host.layer_num
-            kv_data_ptrs += device_kv_data_ptrs[c4_layer_num:]
-            kv_data_lens += device_kv_data_lens[c4_layer_num:]
-            kv_item_lens += device_kv_item_lens[c4_layer_num:]
-            kv_data_mem_kinds += ["VRAM"] * len(device_kv_data_ptrs[c4_layer_num:])
+        else:
+            # -- Existing hisparse / normal path ----------------------------
+            transfer_kv_pool = (
+                self.scheduler.hisparse_coordinator.mem_pool_host
+                if self.scheduler.enable_hisparse
+                else self.token_to_kv_pool
+            )
+            kv_data_ptrs, kv_data_lens, kv_item_lens = get_kv_transfer_buf_infos(
+                transfer_kv_pool
+            )
+            kv_data_mem_kinds = (
+                ["DRAM"] * len(kv_data_ptrs)
+                if self.scheduler.enable_hisparse
+                else ["VRAM"] * len(kv_data_ptrs)
+            )
+            if self.scheduler.enable_hisparse and isinstance(
+                self.token_to_kv_pool, DeepSeekV4TokenToKVPool
+            ):
+                device_kv_data_ptrs, device_kv_data_lens, device_kv_item_lens = (
+                    self.token_to_kv_pool.get_contiguous_buf_infos()
+                )
+                c4_layer_num = (
+                    self.scheduler.hisparse_coordinator.mem_pool_host.layer_num
+                )
+                kv_data_ptrs += device_kv_data_ptrs[c4_layer_num:]
+                kv_data_lens += device_kv_data_lens[c4_layer_num:]
+                kv_item_lens += device_kv_item_lens[c4_layer_num:]
+                kv_data_mem_kinds += ["VRAM"] * len(
+                    device_kv_data_ptrs[c4_layer_num:]
+                )
         num_draft_entries = 0
         if self.draft_token_to_kv_pool is not None:
             # Draft KV shares target virtual ids. Unified target KV is transferred
@@ -2488,6 +2562,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
     """
 
     enable_host_receive: bool = False
+    # One-shot flag: log when the first PD KV transfer lands in the GVA pool.
+    _gva_d2rh_rx_logged: bool = False
 
     def __init__(
         self,
@@ -2848,6 +2924,24 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 self._record_transfer_failure(failure_reason)
                 continue
             elif poll == KVPoll.Success:
+                if (
+                    not DecodeTransferQueue._gva_d2rh_rx_logged
+                    and not is_health_check_req(decode_req.req)
+                ):
+                    from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+                        is_gva_kv_pool_enabled,
+                    )
+
+                    if is_gva_kv_pool_enabled():
+                        DecodeTransferQueue._gva_d2rh_rx_logged = True
+                        logger.info(
+                            "[GVA-D2RH] first PD KV transfer completed for "
+                            "rid=%s: prefix KV pages have been direct-written "
+                            "by the prefill NPU into the decode mf GVA DRAM "
+                            "pool via D2RH; decode sparse attention will now "
+                            "read them in place (no host copy).",
+                            decode_req.req.rid,
+                        )
                 if self.enable_host_receive and decode_req.host_staged:
                     if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
                         self.scheduler.output_streamer.stream_output(

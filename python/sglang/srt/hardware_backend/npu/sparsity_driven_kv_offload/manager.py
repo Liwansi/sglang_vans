@@ -27,6 +27,7 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.budget import (
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     get_sparse_kv_budget,
     get_sparse_kv_indexer_impl,
+    is_gva_kv_pool_enabled,
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.copy_sfa_buffers import (
     copy_sfa_host_row_stride,
@@ -95,6 +96,12 @@ class SparseKVCacheManager:
     miss_shm_dev_ptr: Optional[int] = None
     miss_shm_shape: list = []
     miss_shm_dtype: list = []
+    _miss_refill_logged: bool = False
+    _miss_refill_bulk_logged: bool = False
+    # Native Copy-SFA fused-decode miss observation: sample miss counters at
+    # the first fused call and once more after ~810 calls (~30 decode steps).
+    _copy_sfa_calls: int = 0
+    _copy_sfa_miss_logged: bool = False
 
     def __init__(
         self,
@@ -374,19 +381,89 @@ class SparseKVCacheManager:
         logger.info("Sparse KV host buffer shape: %s", host_kv_shape)
         device_id = torch.npu.current_device()
 
-        try:
-            for layer_idx in range(self.layer_num):
-                shm_cpu_tensor, host_ptr, dev_ptr = create_shm_tensor(
-                    shape=host_kv_shape,
-                    dtype=self.store_dtype,
+        if is_gva_kv_pool_enabled():
+            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.gva_pool import (
+                GVAKVPoolManager,
+            )
+            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+                get_gva_dram_size_gb,
+            )
+
+            try:
+                paged_kv = self.paged_kv_cache
+                self._gva_pool = GVAKVPoolManager(
+                    size=self.size,
+                    max_context_len=self.max_context_len,
+                    page_size=paged_kv.page_size,
+                    kv_cache_dim=paged_kv.kv_cache_dim,
+                    v_cache_dim=paged_kv.kr_cache_dim,
+                    layer_num=self.layer_num,
+                    store_dtype=self.store_dtype,
                     device_id=device_id,
-                    name=f"host_kv_pool_{id(paged_kv_cache)}_layer_{layer_idx}_rank_{device_id}",
+                    dram_size_gb=get_gva_dram_size_gb(),
                 )
-                self.host_kv_buffer.append(shm_cpu_tensor)
-                self.host_ptr_list.append(host_ptr)
-                self.dev_ptr_list.append(dev_ptr)
-        except Exception as e:
-            self._raise_buffer_allocation_error("host_kv_buffer", e)
+                self.host_kv_buffer = self._gva_pool.host_kv_buffer
+                self.host_ptr_list = self._gva_pool.host_ptr_list
+                self.dev_ptr_list = self._gva_pool.dev_ptr_list
+            except Exception as e:
+                self._raise_buffer_allocation_error("host_kv_buffer (GVA)", e)
+        else:
+            self._gva_pool = None
+            try:
+                for layer_idx in range(self.layer_num):
+                    shm_cpu_tensor, host_ptr, dev_ptr = create_shm_tensor(
+                        shape=host_kv_shape,
+                        dtype=self.store_dtype,
+                        device_id=device_id,
+                        name=f"host_kv_pool_{id(paged_kv_cache)}_layer_{layer_idx}_rank_{device_id}",
+                    )
+                    self.host_kv_buffer.append(shm_cpu_tensor)
+                    self.host_ptr_list.append(host_ptr)
+                    self.dev_ptr_list.append(dev_ptr)
+            except Exception as e:
+                self._raise_buffer_allocation_error("host_kv_buffer", e)
+
+        # GVA pools are paged and K/V-split: the flat entry order is
+        # [k_0..k_{L-1}, v_0..v_{L-1}] and rows are addressed by scheduler
+        # token slots instead of (req, pos) rows. Legacy shm pools keep the
+        # combined [req, pos, 1, 576] layout.
+        self.gva_enabled = is_gva_kv_pool_enabled()
+        self._req_to_token = req_to_token_pool.req_to_token
+        if self.gva_enabled:
+            if not self.copy_sfa_enabled:
+                raise RuntimeError(
+                    "SGLANG_NPU_USE_GVA_KV_POOL currently requires the Copy-SFA "
+                    "fused decode path (SGLANG_NPU_ENABLE_COPY_SFA=1); the "
+                    "reference sparse attention path only supports the legacy "
+                    "combined shm host layout."
+                )
+            if paged_kv_cache.page_size != 128:
+                raise RuntimeError(
+                    "GVA host KV pool requires page_size=128 to match the "
+                    f"Copy-SFA block layout, got {paged_kv_cache.page_size}."
+                )
+            if not self._gva_pool.v_buffer:
+                raise RuntimeError(
+                    "GVA host KV pool requires a split V buffer; fp8-packed "
+                    "storage is not supported by Copy-SFA."
+                )
+            self.gva_page_size = paged_kv_cache.page_size
+            self.gva_v_buffer = self._gva_pool.v_buffer
+            self.gva_total_rows = self._gva_pool.num_blocks * self.gva_page_size
+            self._gva_page_starts_cache = None
+            allocator_slots = int(getattr(token_to_kv_pool_allocator, "size", 0))
+            if allocator_slots > self.gva_total_rows:
+                raise RuntimeError(
+                    "GVA host KV pool has fewer rows than the scheduler token "
+                    f"pool: gva_rows={self.gva_total_rows}, "
+                    f"allocator_slots={allocator_slots}. Increase "
+                    "SGLANG_NPU_GVA_DRAM_SIZE_GB or lower --max-total-tokens."
+                )
+        else:
+            self.gva_page_size = 0
+            self.gva_v_buffer = None
+            self.gva_total_rows = 0
+            self._gva_page_starts_cache = None
         self.host_kv_ctx_len = torch.zeros(
             (self.size, self.max_context_len), dtype=torch.int32, device="cpu"
         )
@@ -419,8 +496,76 @@ class SparseKVCacheManager:
             f"max_context_len={self.max_context_len}, "
             f"sparse_context_len={self.sparse_context_len}. "
             "The sparse KV request capacity may be too large; set a smaller "
-            "--max-running-requests for sparse KV offload."
+            f"--max-running-requests for sparse KV offload."
         ) from exc
+
+    def _require_legacy_host_layout(self, path_name: str) -> None:
+        if self.gva_enabled:
+            raise RuntimeError(
+                f"{path_name} reads the combined shm host KV layout and is "
+                "unavailable with SGLANG_NPU_USE_GVA_KV_POOL=1; use the "
+                "Copy-SFA/LIM fused path or disable the GVA pool."
+            )
+
+    def host_row_index(self, req_ids: torch.Tensor, token_pos: torch.Tensor):
+        """Flat host-pool row ids for aligned (req, pos) long tensors.
+
+        GVA pools are addressed by scheduler token slots (req_to_token), so a
+        row id is the slot itself; rows outside valid requests are clamped and
+        must be masked by the caller's valid_mask.
+        """
+        if self.gva_enabled:
+            rows = self._req_to_token.shape[0] - 1
+            cols = self._req_to_token.shape[1] - 1
+            safe_req = req_ids.clamp(0, rows)
+            safe_pos = token_pos.clamp(0, cols)
+            # Paired advanced indexing dispatches to the AiCpu Index op; a
+            # flattened index_select stays on AiCore for the same lookup.
+            offsets = (safe_req * self._req_to_token.shape[1] + safe_pos).reshape(-1)
+            slots = self._req_to_token.view(-1).index_select(0, offsets)
+            return slots.to(torch.long).reshape(req_ids.shape).contiguous()
+        return (req_ids * self.max_context_len + token_pos).contiguous()
+
+    def _gva_page_starts(self, pages: int) -> torch.Tensor:
+        """Cached arange(pages) * page_size clamped to the last token column."""
+        cached = self._gva_page_starts_cache
+        if cached is None or cached.shape[0] != pages:
+            cols = self._req_to_token.shape[1] - 1
+            cached = (
+                torch.arange(pages, device=self.device, dtype=torch.long)
+                * self.gva_page_size
+            ).clamp_(max=cols)
+            self._gva_page_starts_cache = cached
+        return cached
+
+    def _fill_gva_dram_block_table(
+        self,
+        req_ids: torch.Tensor,
+        valid_req: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        """Fill the Copy-SFA DRAM page table from scheduler token slots.
+
+        Physical DRAM pages equal scheduler pages (slot // page_size), so the
+        table is a direct gather of req_to_token page anchors. Pages never
+        allocated by the scheduler are published as -1, which the Copy-SFA
+        kernels treat as an invalid (skipped) row.
+        """
+        pages = int(output.shape[1])
+        batch = int(output.shape[0])
+        safe_req = torch.where(
+            valid_req, req_ids, torch.zeros_like(req_ids)
+        ).long().clamp_(0, self._req_to_token.shape[0] - 1)
+        page_starts = self._gva_page_starts(pages)
+        # The broadcasted paired-index gather dispatches to the AiCpu Index op
+        # (~140us/call); index_select + gather stay on AiCore (~35us/call).
+        slots = self._req_to_token.index_select(0, safe_req).gather(
+            1, page_starts[None, :].expand(batch, pages)
+        )
+        invalid = torch.where(
+            slots >= 0, slots // self.gva_page_size, torch.full_like(slots, -1)
+        )
+        output.copy_(invalid)
 
     def init_req(self, req: Req) -> None:
         if req.inflight_middle_chunks > 0:
@@ -514,13 +659,16 @@ class SparseKVCacheManager:
             hbm_block_table,
         )
         dram_block_table = self.planner_dram_block_table[:batch_size]
-        fill_request_block_table(
-            req_ids_i32,
-            valid_req,
-            self.dram_page_offsets,
-            self.max_context_len // 128,
-            dram_block_table,
-        )
+        if self.gva_enabled:
+            self._fill_gva_dram_block_table(req_ids_i32, valid_req, dram_block_table)
+        else:
+            fill_request_block_table(
+                req_ids_i32,
+                valid_req,
+                self.dram_page_offsets,
+                self.max_context_len // 128,
+                dram_block_table,
+            )
         return (
             self.planner_topk_src_ids[:batch_size],
             self.planner_topk_dst_slots[:batch_size],
@@ -576,6 +724,30 @@ class SparseKVCacheManager:
             hbm_block_table,
             dram_block_table,
         ) = metadata
+        SparseKVCacheManager._copy_sfa_calls += 1
+        _sfa_calls = SparseKVCacheManager._copy_sfa_calls
+        if (
+            _sfa_calls == 1
+            or (_sfa_calls == 810 and not SparseKVCacheManager._copy_sfa_miss_logged)
+        ):
+            try:
+                _topk_miss = int(topk_miss_counts.sum().item())
+                _miss = int(miss_counts.sum().item())
+                if _topk_miss > 0:
+                    SparseKVCacheManager._copy_sfa_miss_logged = True
+                logger.info(
+                    "[Copy-SFA] fused decode miss sample (call #%d): "
+                    "topk_misses=%d, miss_refill_copies=%d, batch=%d, C=%d. "
+                    "Misses are moved DRAM(GVA)->HBM in place by the fused "
+                    "operator.",
+                    _sfa_calls,
+                    _topk_miss,
+                    _miss,
+                    batch_size,
+                    self.device_cache_size,
+                )
+            except Exception:
+                pass
         query_nope = query_nope.squeeze(1).contiguous()
         query_rope = query_rope.squeeze(1).contiguous()
         output_buffer = self.planner_attn_out
@@ -601,6 +773,14 @@ class SparseKVCacheManager:
         combined_hbm_cache = self.device_kv_buffer[layer_idx].view(
             self.size * (self.cache_capacity // 128), 128, self.head_num, self.head_dim
         )
+        if self.gva_enabled:
+            # Flat GVA pool order is [k_0..k_{L-1}, v_0..v_{L-1}]: the K base is
+            # the layer's own entry and the V base is its mirror entry.
+            dram_k_dev_ptr = self.dev_ptr_list[layer_idx]
+            dram_v_dev_ptr = self.dev_ptr_list[self.layer_num + layer_idx]
+        else:
+            dram_k_dev_ptr = self.dev_ptr_list[layer_idx]
+            dram_v_dev_ptr = 0
         fused_scatter_copy_sparse_flash_attention(
             query_nope,
             query_rope,
@@ -616,7 +796,8 @@ class SparseKVCacheManager:
             miss_counts,
             hbm_block_table,
             dram_block_table,
-            self.dev_ptr_list[layer_idx],
+            dram_k_dev_ptr,
+            dram_v_dev_ptr,
             attention_out,
             scale_value,
             operator=self._copy_sfa_operator,
@@ -650,6 +831,7 @@ class SparseKVCacheManager:
         forward_batch: ForwardBatch,
         stream: torch.npu.Stream,
     ):
+        self._require_legacy_host_layout("SparseKVCacheManager.offload")
         layer_idx = layer.layer_id - self.start_layer
         device = k.device
 
@@ -781,16 +963,28 @@ class SparseKVCacheManager:
         # k:         [num_new_tokens, nhead, kv_lora_rank]
         # k_rope:    [num_new_tokens, nhead, qk_rope_head_dim]
         # kv_device: [num_new_tokens, nhead, kv_lora_rank + qk_rope_head_dim]
-        src_tensor = torch.cat([k, k_rope], dim=-1).contiguous()
-        dst_tensor = self.host_kv_buffer[layer_idx]
-        src_index = torch.arange(src_tensor.shape[0], device=device, dtype=torch.long)
-        num_src_rows = int(src_tensor.shape[0])
+        if self.gva_enabled:
+            # GVA pools are K/V-split paged buffers addressed by scheduler
+            # token slots; the fused copy below writes k and k_rope separately.
+            if int(k.shape[1]) != 1 or int(k_rope.shape[1]) != 1:
+                raise RuntimeError(
+                    "GVA offload expects single-head MLA KV rows, got "
+                    f"k heads={int(k.shape[1])}, "
+                    f"k_rope heads={int(k_rope.shape[1])}."
+                )
+            src_tensor = None
+            dst_tensor = None
+        else:
+            src_tensor = torch.cat([k, k_rope], dim=-1).contiguous()
+            dst_tensor = self.host_kv_buffer[layer_idx]
+        num_src_rows = int(k.shape[0])
+        src_index = torch.arange(num_src_rows, device=device, dtype=torch.long)
 
         if is_sparse_mtp_batch(forward_batch):
             req_ids, token_pos, valid_mask = prepare_mtp_rows(
                 forward_batch, num_src_rows, self.size, self.logical_max_context_len
             )
-            dst_index = (req_ids * self.max_context_len + token_pos).reshape(-1)
+            dst_index = self.host_row_index(req_ids, token_pos).reshape(-1)
             valid_mask = valid_mask.reshape(-1).contiguous()
             # TP token padding is a suffix, independent of the request window.
             padding = num_src_rows - dst_index.numel()
@@ -813,7 +1007,7 @@ class SparseKVCacheManager:
                     f"{num_src_rows}."
                 )
 
-            dst_index = (req_ids * self.max_context_len + token_pos).contiguous()
+            dst_index = self.host_row_index(req_ids, token_pos)
             valid_mask = (
                 (forward_batch.seq_lens != 1)
                 & (cache_loc >= 0)
@@ -889,9 +1083,7 @@ class SparseKVCacheManager:
                     + torch.arange(num_src_rows, device=device, dtype=torch.long)
                     - flat_seq_starts
                 )
-                dst_index = (
-                    flat_req_ids * self.max_context_len + token_pos
-                ).contiguous()
+                dst_index = self.host_row_index(flat_req_ids, token_pos)
                 valid_mask = (
                     (flat_req_ids >= 0)
                     & (token_pos >= 0)
@@ -919,11 +1111,9 @@ class SparseKVCacheManager:
                 req_ids_2d = req_ids.unsqueeze(1).expand(batch_size, tokens_per_req)
                 token_pos_2d = extend_prefix_lens.unsqueeze(1) + local_offsets
 
-                dst_index = (
-                    (req_ids_2d * self.max_context_len + token_pos_2d)
-                    .reshape(-1)
-                    .contiguous()
-                )
+                dst_index = self.host_row_index(
+                    req_ids_2d, token_pos_2d
+                ).reshape(-1)
                 valid_mask = (
                     (local_offsets < extend_seq_lens.unsqueeze(1))
                     & (req_ids_2d >= 0)
@@ -940,22 +1130,56 @@ class SparseKVCacheManager:
                 )
             valid_mask = valid_mask.contiguous()
 
-        assert src_tensor.shape[1:] == dst_tensor.shape[2:]
         assert src_index.shape == dst_index.shape == valid_mask.shape
 
         actual_stream = stream if stream is not None else torch.npu.current_stream()
         with torch.npu.stream(actual_stream):
-            unidex_copy_inplace(
-                src_tensor,
-                dst_tensor,
-                src_index,
-                dst_index,
-                valid_mask,
-                1,  # src_tensor: [num_new_tokens, nhead, head_dim]
-                2,  # dst_tensor: [num_req, max_context_len, nhead, head_dim]
-                block_dim=48,
-                dst_ptr=self.dev_ptr_list[layer_idx],
-            )
+            if self.gva_enabled:
+                # GVA rows are scheduler token slots gathered from
+                # req_to_token; unallocated positions hold -1 and must not be
+                # written, so clamp the mask to the pool row range.
+                copy_mask = (
+                    valid_mask
+                    & (dst_index >= 0)
+                    & (dst_index < self.gva_total_rows)
+                ).contiguous()
+                # K (kv_lora_rank) rows land in the layer's K buffer; rope rows
+                # land in the mirrored V buffer entry [layer_num + layer_idx].
+                unidex_copy_inplace(
+                    k,
+                    self.host_kv_buffer[layer_idx],
+                    src_index,
+                    dst_index,
+                    copy_mask,
+                    1,  # k: [num_new_tokens, 1, kv_lora_rank]
+                    3,  # k buffer: [num_blocks, page_size, 1] token-slot rows
+                    block_dim=48,
+                    dst_ptr=self.dev_ptr_list[layer_idx],
+                )
+                unidex_copy_inplace(
+                    k_rope,
+                    self.host_kv_buffer[self.layer_num + layer_idx],
+                    src_index,
+                    dst_index,
+                    copy_mask,
+                    1,  # k_rope: [num_new_tokens, 1, qk_rope_head_dim]
+                    3,  # v buffer: [num_blocks, page_size, 1] token-slot rows
+                    block_dim=48,
+                    dst_ptr=self.dev_ptr_list[self.layer_num + layer_idx],
+                )
+            else:
+                assert src_tensor.shape[1:] == dst_tensor.shape[2:]
+                unidex_copy_inplace(
+                    src_tensor,
+                    dst_tensor,
+                    src_index,
+                    dst_index,
+                    valid_mask,
+                    1,  # src_tensor: [num_new_tokens, nhead, head_dim]
+                    2,  # dst_tensor: [num_req, max_context_len, nhead, head_dim]
+                    block_dim=48,
+                    dst_ptr=self.dev_ptr_list[layer_idx],
+                )
 
     def get_forward_kv(
         self,
@@ -1033,12 +1257,6 @@ class SparseKVCacheManager:
             req_ids = req_ids.index_select(0, keep)
             seq_lens = seq_lens.index_select(0, keep)
 
-        kv_cat = torch.empty(
-            (total_tokens, self.head_num, self.head_dim),
-            dtype=self.store_dtype,
-            device=device,
-        )
-
         seq_starts = torch.cumsum(seq_lens, dim=0) - seq_lens
         src_req_ids = torch.repeat_interleave(
             req_ids, seq_lens, output_size=total_tokens
@@ -1049,11 +1267,27 @@ class SparseKVCacheManager:
         token_pos = (
             torch.arange(total_tokens, device=device, dtype=torch.long) - src_seq_starts
         )
-        src_index = (src_req_ids * self.max_context_len + token_pos).contiguous()
         dst_index = torch.arange(total_tokens, device=device, dtype=torch.long)
-        valid_mask = torch.ones(total_tokens, device=device, dtype=torch.bool)
 
         actual_stream = stream if stream is not None else torch.npu.current_stream()
+
+        if self.gva_enabled:
+            return self._get_forward_kv_gva(
+                layer_idx, src_req_ids, token_pos, dst_index,
+                total_tokens, device, actual_stream,
+            )
+
+        self._require_legacy_host_layout("SparseKVCacheManager.get_forward_kv")
+
+        kv_cat = torch.empty(
+            (total_tokens, self.head_num, self.head_dim),
+            dtype=self.store_dtype,
+            device=device,
+        )
+
+        src_index = (src_req_ids * self.max_context_len + token_pos).contiguous()
+        valid_mask = torch.ones(total_tokens, device=device, dtype=torch.bool)
+
         with torch.npu.stream(actual_stream):
             unidex_copy_inplace(
                 self.host_kv_buffer[layer_idx],
@@ -1070,6 +1304,67 @@ class SparseKVCacheManager:
         k_nope, k_pe = kv_cat.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         return k_nope.contiguous(), k_pe.contiguous()
 
+    def _get_forward_kv_gva(
+        self,
+        layer_idx: int,
+        src_req_ids: torch.Tensor,
+        token_pos: torch.Tensor,
+        dst_index: torch.Tensor,
+        total_tokens: int,
+        device: torch.device,
+        stream: torch.npu.Stream,
+    ):
+        """Gather full request KV from the GVA paged pool (split K/V buffers).
+
+        GVA pool layout:
+            K buffer: [num_blocks, page_size, 1, kv_lora_rank]
+            V buffer: [num_blocks, page_size, 1, qk_rope_head_dim]
+
+        Token slots are resolved via req_to_token[req, pos] instead of the
+        legacy sequential (req * max_context_len + pos) row indexing.
+        """
+        slots = self.host_row_index(src_req_ids, token_pos)
+        valid_mask = (slots >= 0) & (slots < self.gva_total_rows)
+        slots = slots.contiguous()
+        valid_mask = valid_mask.contiguous()
+
+        k_nope_out = torch.empty(
+            (total_tokens, self.head_num, self.kv_lora_rank),
+            dtype=self.store_dtype,
+            device=device,
+        )
+        k_pe_out = torch.empty(
+            (total_tokens, self.head_num, self.qk_rope_head_dim),
+            dtype=self.store_dtype,
+            device=device,
+        )
+
+        with torch.npu.stream(stream):
+            unidex_copy_inplace(
+                self.host_kv_buffer[layer_idx],
+                k_nope_out,
+                slots,
+                dst_index,
+                valid_mask,
+                3,  # K buffer: [num_blocks, page_size, 1, kv_lora_rank]
+                1,  # k_nope_out: [total_tokens, head_num, kv_lora_rank]
+                block_dim=48,
+                src_ptr=self.dev_ptr_list[layer_idx],
+            )
+            unidex_copy_inplace(
+                self.host_kv_buffer[self.layer_num + layer_idx],
+                k_pe_out,
+                slots,
+                dst_index,
+                valid_mask,
+                3,  # V buffer: [num_blocks, page_size, 1, qk_rope_head_dim]
+                1,  # k_pe_out: [total_tokens, head_num, qk_rope_head_dim]
+                block_dim=48,
+                src_ptr=self.dev_ptr_list[self.layer_num + layer_idx],
+            )
+
+        return k_nope_out.contiguous(), k_pe_out.contiguous()
+
     def materialize_selected_kv(
         self,
         layer: RadixAttention,
@@ -1083,6 +1378,9 @@ class SparseKVCacheManager:
         The caller waits for miss_done before attention and refill_done after
         attention, protecting the shared workspace and the next cache lookup.
         """
+        self._require_legacy_host_layout(
+            "SparseKVCacheManager.materialize_selected_kv"
+        )
         layer_idx = layer.layer_id - self.start_layer
         stream = stream if stream is not None else torch.npu.current_stream()
 
@@ -1152,6 +1450,34 @@ class SparseKVCacheManager:
             )
 
             host_miss_mask = (~token_on_device) & valid_topk_mask
+            if not SparseKVCacheManager._miss_refill_logged:
+                _n_missed = int(host_miss_mask.sum())
+                if _n_missed > 0:
+                    SparseKVCacheManager._miss_refill_logged = True
+                    logger.info(
+                        "[Copy-SFA] miss refill triggered: %d of %d top-k "
+                        "entries missed the HBM device cache (C=%d) on layer "
+                        "%d; the fused operator is moving them DRAM(GVA)->HBM "
+                        "in place, exercising the miss path.",
+                        _n_missed,
+                        batch_size * topk_len,
+                        self.device_cache_size,
+                        layer_idx,
+                    )
+                    if (
+                        _n_missed >= (batch_size * topk_len) // 2
+                        and not SparseKVCacheManager._miss_refill_bulk_logged
+                    ):
+                        SparseKVCacheManager._miss_refill_bulk_logged = True
+                        logger.info(
+                            "[Copy-SFA] bulk miss refill: %d/%d top-k entries "
+                            "missed (>=half of top-k, typical of a fresh long "
+                            "request over C=%d); a full DRAM(GVA)->HBM refill "
+                            "wave is running via the fused operator.",
+                            _n_missed,
+                            batch_size * topk_len,
+                            self.device_cache_size,
+                        )
             miss_src_index, miss_dst_index, miss_valid_mask = _build_miss_src_dst_index(
                 host_miss_mask,
                 topk_indices,

@@ -24,6 +24,9 @@ _DEFAULT_PROTOCOL = "sdma"
 
 
 class AscendTransferEngine(MooncakeTransferEngine):
+    # One-shot flag: log the first actual PD transfer once per process.
+    _d2rh_xfer_logged: bool = False
+
     def __init__(
         self,
         hostname: str,
@@ -75,6 +78,8 @@ class AscendTransferEngine(MooncakeTransferEngine):
             )
 
         trans_op_type = self._resolve_trans_op_type(transfer_protocol)
+        # Actual op after any fallback; used for accurate transfer logging.
+        self._resolved_trans_op = trans_op_type.name
         """Initialize the ascend transfer instance."""
         ret_value = self.engine.initialize(
             self.store_url, self.session_id, self.role, self.npu_id, trans_op_type
@@ -91,6 +96,34 @@ class AscendTransferEngine(MooncakeTransferEngine):
             ret_value = -1
         if ret_value != 0:
             logger.debug(f"Ascend memory registration for ptr {ptrs} failed.")
+
+    def batch_transfer_sync(
+        self,
+        session_id: str,
+        buffers: List[int],
+        peer_buffer_addresses: List[int],
+        lengths: List[int],
+    ) -> int:
+        """PD KV transfer through memfabric_hybrid (D2RH-capable) engine.
+
+        The engine routes by the peer-registered memory kind: writes into
+        the decode side's GVA DRAM pool go device-to-remote-host (D2RH)
+        directly from this prefill NPU; HBM destinations go device D2D.
+        """
+        if not AscendTransferEngine._d2rh_xfer_logged:
+            AscendTransferEngine._d2rh_xfer_logged = True
+            logger.info(
+                "[GVA-D2RH] PD KV transfer started via memfabric_hybrid "
+                "(mf) engine op=%s: %d blocks / %.2f MiB direct-written "
+                "from the prefill NPU to the peer (decode GVA DRAM when "
+                "registered as DRAM, else HBM)",
+                self._resolved_trans_op,
+                len(buffers),
+                sum(lengths) / (1 << 20),
+            )
+        return super().batch_transfer_sync(
+            session_id, buffers, peer_buffer_addresses, lengths
+        )
 
     @staticmethod
     def _get_transfer_protocol() -> str:

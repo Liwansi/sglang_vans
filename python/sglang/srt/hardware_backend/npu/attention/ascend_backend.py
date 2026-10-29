@@ -366,14 +366,22 @@ class AscendAttnBackend(AttentionBackend):
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.graph_mode = False
         self.use_fa = get_bool_env_var("ASCEND_USE_FA", "False")
-        self.enable_sparsity_driven_kv_offload = is_sparsity_driven_kv_offload_enabled(
-            model_config=model_runner.model_config,
-            use_mla_backend=model_runner.use_mla_backend,
+        # HiSparse/SparseKV offload is a target-model optimization. The MTP
+        # draft model keeps its normal KV cache and does not create a second
+        # GVA/Copy-SFA manager.
+        self.enable_sparsity_driven_kv_offload = (
+            not self.is_draft_worker
+            and is_sparsity_driven_kv_offload_enabled(
+                model_config=model_runner.model_config,
+                use_mla_backend=model_runner.use_mla_backend,
+            )
         )
         # Draft-decode steps and draft-extend use different attention backends
         # over the same KV pool. They must also share its host KV and residency.
-        self.sparse_kv_manager = getattr(
-            self.token_to_kv_pool, "sparse_kv_manager", None
+        self.sparse_kv_manager = (
+            getattr(self.token_to_kv_pool, "sparse_kv_manager", None)
+            if not self.is_draft_worker
+            else None
         )
         if self.enable_sparsity_driven_kv_offload and self.sparse_kv_manager is None:
             from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager import (

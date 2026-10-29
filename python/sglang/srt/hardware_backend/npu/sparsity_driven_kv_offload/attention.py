@@ -147,19 +147,75 @@ def _forward_sparse_mtp(backend, q, q_rope, layer, forward_batch, topk_indices):
             selected.zero_()
             safe_requests = requests[:, column].clamp(0, manager.size - 1)
             layer_index = layer.layer_id - manager.start_layer
-            unidex_copy_inplace(
-                manager.host_kv_buffer[layer_index],
-                selected,
-                (safe_requests[:, None] * manager.max_context_len + source)
-                .reshape(-1)
-                .contiguous(),
-                torch.arange(batch * top_k, device=q.device),
-                valid.reshape(-1).contiguous(),
-                2,
-                2,
-                block_dim=24,
-                src_ptr=manager.dev_ptr_list[layer_index],
-            )
+            dst_rows = torch.arange(batch * top_k, device=q.device)
+            if manager.gva_enabled:
+                # GVA pools are K/V-split and paged by scheduler token slots:
+                # gather both halves through req_to_token, then stitch.
+                pair = safe_requests[:, None].expand_as(source)
+                slots = manager.host_row_index(pair, source).reshape(-1)
+                keep = (
+                    valid.reshape(-1)
+                    & (slots >= 0)
+                    & (slots < manager.gva_total_rows)
+                ).contiguous()
+                k_rows = torch.empty(
+                    (batch * top_k, selected.shape[2], backend.kv_lora_rank),
+                    dtype=selected.dtype,
+                    device=q.device,
+                )
+                v_rows = torch.empty(
+                    (batch * top_k, selected.shape[2], backend.qk_rope_head_dim),
+                    dtype=selected.dtype,
+                    device=q.device,
+                )
+                unidex_copy_inplace(
+                    manager.host_kv_buffer[layer_index],
+                    k_rows,
+                    slots,
+                    dst_rows,
+                    keep,
+                    3,
+                    1,
+                    block_dim=24,
+                    src_ptr=manager.dev_ptr_list[layer_index],
+                )
+                unidex_copy_inplace(
+                    manager.host_kv_buffer[manager.layer_num + layer_index],
+                    v_rows,
+                    slots,
+                    dst_rows,
+                    keep,
+                    3,
+                    1,
+                    block_dim=24,
+                    src_ptr=manager.dev_ptr_list[
+                        manager.layer_num + layer_index
+                    ],
+                )
+                selected[..., : backend.kv_lora_rank].copy_(
+                    k_rows.view(
+                        batch, top_k, selected.shape[2], backend.kv_lora_rank
+                    )
+                )
+                selected[..., backend.kv_lora_rank :].copy_(
+                    v_rows.view(
+                        batch, top_k, selected.shape[2], backend.qk_rope_head_dim
+                    )
+                )
+            else:
+                unidex_copy_inplace(
+                    manager.host_kv_buffer[layer_index],
+                    selected,
+                    (safe_requests[:, None] * manager.max_context_len + source)
+                    .reshape(-1)
+                    .contiguous(),
+                    dst_rows,
+                    valid.reshape(-1).contiguous(),
+                    2,
+                    2,
+                    block_dim=24,
+                    src_ptr=manager.dev_ptr_list[layer_index],
+                )
             compact = torch.arange(top_k, device=q.device, dtype=torch.int32)
             indices = compact[None].expand(batch, -1).masked_fill(~valid, -1)
             nonempty = valid.any(dim=1)

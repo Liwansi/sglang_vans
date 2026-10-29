@@ -249,20 +249,26 @@ class LIMDecodeAdapter:
         lengths = valid.to(torch.int32) * self.capacity
         manager.planner_actual_seq_lengths_kv[:batch].copy_(lengths)
         manager.planner_num_cache_tokens[:batch].copy_(lengths)
-        for pages, offsets, output in (
-            (
-                self.capacity // 128,
-                manager.hbm_page_offsets,
-                manager.planner_hbm_block_table,
-            ),
-            (
-                manager.max_context_len // 128,
-                manager.dram_page_offsets,
-                manager.planner_dram_block_table,
-            ),
-        ):
+        fill_request_block_table(
+            plan.request_slots,
+            valid,
+            manager.hbm_page_offsets,
+            self.capacity // 128,
+            manager.planner_hbm_block_table[:batch],
+        )
+        if manager.gva_enabled:
+            # GVA DRAM pages are scheduler pages: gather page anchors from
+            # req_to_token instead of the legacy sequential offsets.
+            manager._fill_gva_dram_block_table(
+                plan.request_slots, valid, manager.planner_dram_block_table[:batch]
+            )
+        else:
             fill_request_block_table(
-                plan.request_slots, valid, offsets, pages, output[:batch]
+                plan.request_slots,
+                valid,
+                manager.dram_page_offsets,
+                manager.max_context_len // 128,
+                manager.planner_dram_block_table[:batch],
             )
         return (
             plan.source_ids.unsqueeze(1),
@@ -288,25 +294,98 @@ class LIMDecodeAdapter:
             & (sources < plan.seq_lens[:, None])
         )
         rows = plan.request_slots.long().clamp(max=self.rows - 1)
-        copy(
-            manager.host_kv_buffer[layer_index],
-            selected,
-            (rows[:, None] * manager.max_context_len + sources)
-            .reshape(-1)
-            .contiguous(),
-            torch.arange(batch * self.top_k, device=selected.device),
-            valid.reshape(-1).contiguous(),
-            2,
-            2,
-            block_dim=24,
-            src_ptr=manager.dev_ptr_list[layer_index],
-        )
+        dst = torch.arange(batch * self.top_k, device=selected.device)
+        if manager.gva_enabled:
+            # GVA pools are K/V-split and paged by scheduler token slots: the
+            # source row is req_to_token[req, pos], so gather each half through
+            # its own buffer and stitch into the combined selected rows.
+            pair = rows[:, None].expand_as(sources)
+            slots = manager.host_row_index(pair, sources).reshape(-1)
+            keep = (
+                valid.reshape(-1)
+                & (slots >= 0)
+                & (slots < manager.gva_total_rows)
+            ).contiguous()
+            k_rows = torch.empty(
+                (
+                    batch * self.top_k,
+                    selected.shape[2],
+                    manager.kv_lora_rank,
+                ),
+                dtype=selected.dtype,
+                device=selected.device,
+            )
+            v_rows = torch.empty(
+                (
+                    batch * self.top_k,
+                    selected.shape[2],
+                    manager.qk_rope_head_dim,
+                ),
+                dtype=selected.dtype,
+                device=selected.device,
+            )
+            copy(
+                manager.host_kv_buffer[layer_index],
+                k_rows,
+                slots,
+                dst,
+                keep,
+                3,
+                1,
+                block_dim=24,
+                src_ptr=manager.dev_ptr_list[layer_index],
+            )
+            copy(
+                manager.host_kv_buffer[manager.layer_num + layer_index],
+                v_rows,
+                slots,
+                dst,
+                keep,
+                3,
+                1,
+                block_dim=24,
+                src_ptr=manager.dev_ptr_list[
+                    manager.layer_num + layer_index
+                ],
+            )
+            selected[..., : manager.kv_lora_rank].copy_(
+                k_rows.view(
+                    batch, self.top_k, selected.shape[2], manager.kv_lora_rank
+                )
+            )
+            selected[..., manager.kv_lora_rank :].copy_(
+                v_rows.view(
+                    batch,
+                    self.top_k,
+                    selected.shape[2],
+                    manager.qk_rope_head_dim,
+                )
+            )
+        else:
+            copy(
+                manager.host_kv_buffer[layer_index],
+                selected,
+                (rows[:, None] * manager.max_context_len + sources)
+                .reshape(-1)
+                .contiguous(),
+                dst,
+                valid.reshape(-1).contiguous(),
+                2,
+                2,
+                block_dim=24,
+                src_ptr=manager.dev_ptr_list[layer_index],
+            )
         stream = torch.npu.current_stream(manager.device)
         stream.record_event(manager.miss_done)
         stream.record_event(manager.refill_done)
 
     def materialize(self, manager, plan, layer_index, selected, stream, *, copy):
         """Consume native plans directly; no Python lookup, sort or LRU rebuild."""
+        if manager.gva_enabled:
+            raise RuntimeError(
+                "LIM materialize reads the combined shm host KV layout and is "
+                "unavailable with the GVA pool."
+            )
         batch = selected.shape[0]
         with torch.npu.stream(stream):
             req = plan.request_slots.long()
@@ -363,6 +442,11 @@ class LIMDecodeAdapter:
             stream.record_event(manager.refill_done)
 
     def append_tail(self, manager, plan, layer_index, selected, *, copy):
+        if manager.gva_enabled:
+            raise RuntimeError(
+                "LIM append_tail reads the combined shm host KV layout and is "
+                "unavailable with the GVA pool."
+            )
         batch = selected.shape[0]
         combined = self.combined_kv[:batch]
         combined.zero_()

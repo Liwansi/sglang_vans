@@ -1065,6 +1065,15 @@ class Envs:
     SGLANG_NPU_SPARSE_KV_INDEXER = EnvStr("legacy")
     # Optional operator-enabled library; loaded once before graph capture.
     SGLANG_NPU_ENABLE_COPY_SFA = EnvBool(False)
+    # Use memfabric_hybrid GVA (Global Virtual Address) for the host KV pool
+    # instead of create_shm_tensor.  Only TP rank 0 allocates physical DRAM;
+    # all TP ranks share the same virtual address via IOMMU mapping.
+    # Per-DP-group isolation uses store_port = 8500 + dp_index.
+    SGLANG_NPU_USE_GVA_KV_POOL = EnvBool(False)
+    # DRAM budget (in GiB) for the GVA shared KV pool.  The pool capacity
+    # (num_blocks) is derived from this budget, NOT from the full token
+    # capacity.  Defaults to 32 GiB.  Only rank 0 allocates physical DRAM.
+    SGLANG_NPU_GVA_DRAM_SIZE_GB = EnvInt(32)
     # Use FIAS V2 for DSpark MLA target verify and MHA draft paths. Graph
     # replay requires torch_npu's V2 handler to update actual_seq_kvlen.
     SGLANG_NPU_USE_FIAS_V2_BSND = EnvBool(False)

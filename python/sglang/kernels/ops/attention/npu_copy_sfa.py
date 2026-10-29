@@ -33,7 +33,8 @@ def fused_scatter_copy_sparse_flash_attention(
     miss_counts,
     hbm_block_table,
     dram_block_table,
-    dram_kv_dev_ptr,
+    dram_k_dev_ptr,
+    dram_v_dev_ptr,
     attention_out,
     scale_value,
     *,
@@ -42,6 +43,11 @@ def fused_scatter_copy_sparse_flash_attention(
     """Fill Q1 resident KV and attend to K=2048 selected combined-cache tokens.
 
     Resident capacity C is 2048, 4096 or 8192; request miss rows have width C.
+
+    ``dram_k_dev_ptr`` is the NPU-visible base of the DRAM CKV[512] rows. A
+    non-zero ``dram_v_dev_ptr`` selects the GVA split layout where rope/V[64]
+    rows live in a separate buffer; zero keeps the legacy combined [CKV|KPE]
+    576-stride rows derived from the K base.
 
     Native host validation checks the remaining metadata/layout/device contract
     without device scalar reads. Buffer ownership stays with the runtime manager.
@@ -52,6 +58,10 @@ def fused_scatter_copy_sparse_flash_attention(
         raise ValueError("Copy-SFA query rope must be [B,H,64].")
     if query.dtype not in (torch.float16, torch.bfloat16):
         raise ValueError("Copy-SFA requires FP16/BF16 query and KV storage.")
+    if not isinstance(dram_k_dev_ptr, int) or dram_k_dev_ptr <= 0:
+        raise ValueError("Copy-SFA dram_k_dev_ptr must be a positive integer address.")
+    if not isinstance(dram_v_dev_ptr, int) or dram_v_dev_ptr < 0:
+        raise ValueError("Copy-SFA dram_v_dev_ptr must be a non-negative integer address.")
     if operator is None:
         operator = load_copy_sfa_operator()
     operator(
@@ -69,7 +79,8 @@ def fused_scatter_copy_sparse_flash_attention(
         miss_counts,
         hbm_block_table,
         dram_block_table,
-        dram_kv_dev_ptr,
+        dram_k_dev_ptr,
+        dram_v_dev_ptr,
         attention_out,
         scale_value,
     )

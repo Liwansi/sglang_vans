@@ -110,6 +110,16 @@ def is_sparsity_driven_kv_offload_enabled(
     return True
 
 
+def is_gva_kv_pool_enabled() -> bool:
+    if not envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get():
+        return False
+    return envs.SGLANG_NPU_USE_GVA_KV_POOL.get()
+
+
+def get_gva_dram_size_gb() -> int:
+    return int(envs.SGLANG_NPU_GVA_DRAM_SIZE_GB.get())
+
+
 def get_sparse_kv_indexer_impl() -> str:
     value = envs.SGLANG_NPU_SPARSE_KV_INDEXER.get()
     if value not in ("legacy", "li_reference", "lim"):
