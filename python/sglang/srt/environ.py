@@ -1063,6 +1063,10 @@ class Envs:
     # Experimental Q1 indexer/cache implementations. li_reference and lim use
     # the same page-aligned prefix + visible tail attention policy.
     SGLANG_NPU_SPARSE_KV_INDEXER = EnvStr("legacy")
+    SGLANG_NPU_FUSED_LIM_COPY_SFA_METADATA = EnvBool(False)
+    SGLANG_NPU_FUSED_LIM_PRE_METADATA = EnvBool(False)
+    # Experimental MTP path; requires a matching full-visible LIM kernel.
+    SGLANG_ENABLE_NPU_LIM_MTP_FULL_VISIBLE = EnvBool(False)
     # Optional operator-enabled library; loaded once before graph capture.
     SGLANG_NPU_ENABLE_COPY_SFA = EnvBool(False)
     # Use memfabric_hybrid GVA (Global Virtual Address) for the host KV pool

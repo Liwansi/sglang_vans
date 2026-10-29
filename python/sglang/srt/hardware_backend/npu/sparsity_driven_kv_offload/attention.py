@@ -20,6 +20,7 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.mtp import (
     mtp_selected_kv_view,
     mtp_topk_rows,
     prepare_mtp_rows,
+    use_native_mtp_verify,
 )
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 
@@ -68,7 +69,8 @@ def _copy_sfa_decode_eligible(backend, forward_batch, layer, q, topk_indices):
         and backend.qk_rope_head_dim == 64
         and q.dtype in (torch.bfloat16, torch.float16)
         and normalize_batch_topk_indices(topk_indices).shape[1] == 2048
-        and manager.cache_capacity in (2048, 4096, 8192)
+        and 2048 <= manager.cache_capacity <= 32640
+        and manager.cache_capacity % 128 == 0
         and manager.sparse_context_len == 2048
         and q.shape[0] == forward_batch.batch_size
     )
@@ -283,6 +285,24 @@ def forward_sparsity_driven_kv_offload(
         sparse_kv_manager.offload_v2(k_nope, k_pe, layer, forward_batch, stream)
 
     if is_sparse_mtp_batch(forward_batch):
+        if use_native_mtp_verify(backend, forward_batch, sparse_kv_manager):
+            plan = backend.forward_metadata.sparse_kv_lim_plan
+            if plan is None:
+                raise RuntimeError("Native MTP verify requires an owner union plan.")
+            batch = forward_batch.batch_size
+            rows = batch * 4
+            query_nope = q_nope[:rows].view(rows, -1, backend.kv_lora_rank)
+            query_rope = q_pe[:rows].view(rows, -1, backend.qk_rope_head_dim)
+            result = sparse_kv_manager.copy_sfa_mtp_verify(
+                layer, query_nope, query_rope, layer.tp_q_head_num, layer.scaling, plan
+            )
+            sparse_kv_manager.last_decode_path = (
+                "mtp_verify_lim_copy_sfa_fused_metadata"
+                if sparse_kv_manager.lim_adapter.fused_copy_metadata
+                else "mtp_verify_lim_copy_sfa"
+            )
+            forward_batch.sparse_kv_decode_path = sparse_kv_manager.last_decode_path
+            return torch.nn.functional.pad(result, (0, 0, 0, q_nope.shape[0] - rows))
         return _forward_sparse_mtp(
             backend, q_nope, q_pe, layer, forward_batch, topk_indices
         )
