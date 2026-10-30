@@ -33,7 +33,8 @@ def fused_scatter_copy_sparse_flash_attention(
     miss_counts,
     hbm_block_table,
     dram_block_table,
-    dram_kv_dev_ptr,
+    dram_k_dev_ptr,
+    dram_v_dev_ptr,
     attention_out,
     scale_value,
     *,
@@ -48,7 +49,9 @@ def fused_scatter_copy_sparse_flash_attention(
     without appending a tail; Q4 supports C=12288 and a request union miss list
     with up to 32768 entries. Native host validation checks the remaining
     metadata, layout and device contract without reading device scalar values.
-    Buffer ownership stays with the runtime manager.
+    ``dram_k_dev_ptr`` is the registered CKV base. ``dram_v_dev_ptr`` is the
+    registered rope/V base for GVA split storage, or zero for the legacy
+    combined DRAM layout. Buffer ownership stays with the runtime manager.
     """
     if query.ndim != 3 or query.shape[2] != 512:
         raise ValueError("Copy-SFA query must be [T,H,512].")
@@ -73,7 +76,8 @@ def fused_scatter_copy_sparse_flash_attention(
         miss_counts,
         hbm_block_table,
         dram_block_table,
-        dram_kv_dev_ptr,
+        dram_k_dev_ptr,
+        dram_v_dev_ptr,
         attention_out,
         scale_value,
     )

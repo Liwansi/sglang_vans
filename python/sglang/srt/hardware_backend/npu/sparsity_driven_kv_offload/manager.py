@@ -775,6 +775,16 @@ class SparseKVCacheManager:
         combined = self.device_kv_buffer[layer_idx].view(
             self.size * (self.cache_capacity // 128), 128, self.head_num, self.head_dim
         )
+        if self.gva_enabled:
+            # GVA stores K and rope/V in separate per-layer buffers.  The
+            # fused kernel consumes both registered device-visible bases.
+            dram_k_dev_ptr = self.dev_ptr_list[layer_idx]
+            dram_v_dev_ptr = self.dev_ptr_list[self.layer_num + layer_idx]
+        else:
+            # Legacy DRAM uses one combined [CKV|KPE] buffer.  A zero V base
+            # selects that layout inside the kernel.
+            dram_k_dev_ptr = self.dev_ptr_list[layer_idx]
+            dram_v_dev_ptr = 0
         fused_scatter_copy_sparse_flash_attention(
             query_nope.contiguous(),
             query_rope.contiguous(),
@@ -790,7 +800,8 @@ class SparseKVCacheManager:
             plan.miss_counts,
             self.planner_hbm_block_table[:batch],
             self.planner_dram_block_table[:batch],
-            self.dev_ptr_list[layer_idx],
+            dram_k_dev_ptr,
+            dram_v_dev_ptr,
             output,
             scale_value,
             operator=self._copy_sfa_operator,
