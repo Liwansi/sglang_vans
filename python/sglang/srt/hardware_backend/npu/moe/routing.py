@@ -98,6 +98,7 @@ def npu_moe_init_routing(
     quant_mode: int = -1,
     scale: Optional[torch.Tensor] = None,
     active_num: Optional[int] = None,
+    active_expert_range: Optional[list[int]] = None,
 ) -> RoutedTokens:
     """Permute tokens into expert order with ``npu_moe_init_routing_v2``.
 
@@ -123,7 +124,7 @@ def npu_moe_init_routing(
             expert_tokens_num_flag=True,
             expert_tokens_num_type=1,
             row_idx_type=0,
-            active_expert_range=[0, num_experts],
+            active_expert_range=active_expert_range or [0, num_experts],
             # Already quantized: permute the payload and its traveling scale
             # without quantizing again.
             quant_mode=-1,
@@ -149,7 +150,7 @@ def npu_moe_init_routing(
         expert_tokens_num_type=1,
         expert_tokens_num_flag=True,
         row_idx_type=0,
-        active_expert_range=[0, num_experts],
+        active_expert_range=active_expert_range or [0, num_experts],
         quant_mode=quant_mode,
     )
     if active_num is not None:
@@ -197,4 +198,26 @@ def npu_moe_finalize_routing(
         expanded_src_to_dst_row=expanded_row_idx.to(torch.int32).contiguous(),
         export_for_source_row=topk_ids,
         drop_pad_mode=drop_pad_mode,
+    )
+
+
+def npu_moe_token_unpermute(
+    hidden_states: torch.Tensor,
+    expanded_row_idx: torch.Tensor,
+    topk_weights: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Unpermute expert outputs into token order.
+
+    This is the compact AllGather combine primitive.  Unlike
+    ``npu_moe_finalize_routing``, the token-unpermute op consumes the compact
+    expert output directly and does not require a full route-capacity buffer.
+    """
+    # Keep the call on the torch_npu Python API, which is the interface used
+    # by sgl-kernel-npu and handles the registered operator signature.
+    import torch_npu
+
+    return torch_npu.npu_moe_token_unpermute(
+        permuted_tokens=hidden_states,
+        sorted_indices=expanded_row_idx,
+        probs=topk_weights,
     )

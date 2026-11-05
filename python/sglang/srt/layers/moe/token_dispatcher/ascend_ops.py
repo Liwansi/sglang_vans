@@ -20,8 +20,13 @@ from sglang.srt.hardware_backend.npu.moe.routing import (
     normalize_mxfp_scale,
     npu_moe_finalize_routing,
     npu_moe_init_routing,
+    npu_moe_token_unpermute,
 )
-from sglang.srt.layers.dp_attention import get_is_extend_in_batch
+from sglang.srt.layers.dp_attention import (
+    get_dp_global_num_tokens,
+    get_is_extend_in_batch,
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
@@ -434,14 +439,46 @@ class AscendOpsDispatcher(BaseDispatcher):
             raise NotImplementedError(
                 "NPU AllGather supports BF16, INT8 and MXFP8 routing"
             )
-        # CP and DP can split a batch unevenly (for example with interleaved or
-        # zigzag schedules).  Deriving row counts from DP metadata assumes an
-        # equal split and becomes incorrect as soon as CP is enabled.  Exchange
-        # the actual local row count so the subsequent padded all-gather and
-        # reduce-scatter use the exact layout produced by the attention path.
-        row_sizes = self._allgather_row_sizes(
-            hidden_states.shape[0], group, hidden_states.device
-        )
+        parallel = get_parallel()
+        global_rows = get_dp_global_num_tokens()
+        if (
+            is_dp_attention_enabled()
+            and parallel.attn_cp_size == 1
+            and global_rows is not None
+        ):
+            # Attention-DP already publishes the global token count for every
+            # DP rank.  Reuse it instead of launching a row-count all_gather.
+            # Expand each DP row across the TP ranks in the communication
+            # group, matching the rank-major layout used by AllGather.
+            if len(global_rows) * parallel.attn_tp_size != dist.get_world_size(
+                group
+            ):
+                raise ValueError(
+                    "Ascend Ops DP token metadata does not match the AllGather "
+                    f"group: metadata has {len(global_rows)} DP rows, "
+                    f"attn_tp_size={parallel.attn_tp_size}, "
+                    f"group size={dist.get_world_size(group)}"
+                )
+            row_sizes = []
+            for rows in global_rows:
+                base, extra = divmod(rows, parallel.attn_tp_size)
+                row_sizes.extend(
+                    base + int(rank < extra)
+                    for rank in range(parallel.attn_tp_size)
+                )
+            rank = dist.get_rank(group)
+            if row_sizes[rank] != hidden_states.shape[0]:
+                raise ValueError(
+                    "Ascend Ops local rows disagree with DP token metadata: "
+                    f"rank has {hidden_states.shape[0]}, "
+                    f"expected {row_sizes[rank]}"
+                )
+        else:
+            # CP can create interleaved/zigzag local row counts, so the DP
+            # metadata is insufficient there. Exchange the exact local count.
+            row_sizes = self._allgather_row_sizes(
+                hidden_states.shape[0], group, hidden_states.device
+            )
         world_size = len(row_sizes)
         max_rows = max(row_sizes)
         if max_rows == 0:
