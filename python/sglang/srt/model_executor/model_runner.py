@@ -266,11 +266,19 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu_arm64 = is_host_cpu_arm64()
 
 if _is_npu:
+    from sglang.srt.hardware_backend.npu.eplb_statistics import (
+        isolate_draft_expert_recording,
+    )
     from sglang.srt.hardware_backend.npu.utils import init_npu_backend
 
     init_npu_backend()
-elif current_platform.is_out_of_tree():
-    current_platform.init_backend()
+else:
+
+    def isolate_draft_expert_recording(forward):
+        return forward
+
+    if current_platform.is_out_of_tree():
+        current_platform.init_backend()
 
 # Detect stragger ranks in model loading
 
@@ -1865,6 +1873,7 @@ class ModelRunner:
             kwargs["get_embedding"] = True
         return kwargs
 
+    @isolate_draft_expert_recording
     def forward(
         self,
         forward_batch: ForwardBatch,

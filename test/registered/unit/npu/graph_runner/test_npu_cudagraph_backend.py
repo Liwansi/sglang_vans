@@ -32,7 +32,9 @@ def _make_backend(runner=None):
     # a white-box runner to exercise a specific replay() branch.
     if runner is None:
         runner = SimpleNamespace(
-            device_module=_device_module_stub(), enable_torch_compile=False
+            device_module=_device_module_stub(),
+            enable_torch_compile=False,
+            model_runner=SimpleNamespace(is_draft_worker=False),
         )
     with (
         get_parallel().override(tp_group=SimpleNamespace(barrier=mock.Mock())),
@@ -60,6 +62,7 @@ def _make_eagle_draft_runner(
                 architectures=architectures, index_topk=index_topk
             )
         ),
+        is_draft_worker=True,
     )
     return runner
 
@@ -81,6 +84,7 @@ def _make_decode_runner(raw_bs=2, bs=2):
             is_dspark=mock.Mock(return_value=False),
             is_dflash=mock.Mock(return_value=False),
         ),
+        is_draft_worker=False,
     )
     runner.capture_forward_mode = SimpleNamespace(
         is_target_verify=mock.Mock(return_value=False)
