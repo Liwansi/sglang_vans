@@ -266,19 +266,11 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu_arm64 = is_host_cpu_arm64()
 
 if _is_npu:
-    from sglang.srt.hardware_backend.npu.eplb_statistics import (
-        isolate_draft_expert_recording,
-    )
     from sglang.srt.hardware_backend.npu.utils import init_npu_backend
 
     init_npu_backend()
-else:
-
-    def isolate_draft_expert_recording(forward):
-        return forward
-
-    if current_platform.is_out_of_tree():
-        current_platform.init_backend()
+elif current_platform.is_out_of_tree():
+    current_platform.init_backend()
 
 # Detect stragger ranks in model loading
 
@@ -1873,7 +1865,6 @@ class ModelRunner:
             kwargs["get_embedding"] = True
         return kwargs
 
-    @isolate_draft_expert_recording
     def forward(
         self,
         forward_batch: ForwardBatch,
@@ -1911,10 +1902,19 @@ class ModelRunner:
             else contextlib.nullcontext()
         )
 
+        recorder = get_global_expert_distribution_recorder()
+        # Draft batches can also be TARGET_VERIFY. Enter the role-based guard
+        # before the recorder resets counters or appends a record.
+        record_ctx = (
+            recorder.disable_this_region()
+            if self.is_draft_worker
+            else contextlib.nullcontext()
+        )
         with (
             canary_ctx,
             step_span_ctx,
-            get_global_expert_distribution_recorder().with_forward_pass(
+            record_ctx,
+            recorder.with_forward_pass(
                 self.forward_pass_id,
                 forward_batch,
             ) as recorder_outputs,

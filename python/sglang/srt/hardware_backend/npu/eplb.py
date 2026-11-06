@@ -21,58 +21,50 @@ Import torch_npu only when an NPU operation actually needs it.
 from __future__ import annotations
 
 import logging
-import time
 from collections import deque
 from typing import TYPE_CHECKING, Callable, NamedTuple
 
 import torch
 import torch.distributed as dist
 
+from sglang.srt.runtime_context import get_device, get_exec, get_parallel, get_resources
+
 if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location import ExpertLocationMetadata
 
 logger = logging.getLogger(__name__)
-_warmed_device_group = None
 
 
-def get_eplb_device_group() -> dist.ProcessGroup:
-    """Reuse TP's device group and its existing communication configuration."""
-    from sglang.srt.runtime_context import get_parallel
-
+def get_eplb_group() -> dist.ProcessGroup | None:
+    """Return a compatible TP device group, or None to select default WORLD."""
+    if not dist.is_initialized():
+        return None
     tp_group = get_parallel().tp_group
-    # Shared statistics and migration use WORLD ranks, including root rank 0.
-    if tp_group.ranks != list(range(dist.get_world_size())):
-        raise ValueError(
-            "NPU EPLB requires a TP group covering WORLD in rank order; "
-            "TP subgroups are not supported."
-        )
+    # Placement maps, collective roots, and P2P peers use WORLD ranks. Reuse TP
+    # only with the same ordered members and backend; elastic EP keeps WORLD.
+    if (
+        get_exec().moe.elastic_ep_backend
+        or tp_group is None
+        or tp_group.ranks != list(range(dist.get_world_size()))
+        or dist.get_backend(tp_group.device_group) != dist.get_backend()
+    ):
+        return None
     return tp_group.device_group
 
 
-def _get_migration_group() -> dist.ProcessGroup:
-    from sglang.srt.runtime_context import get_parallel
-
-    parallel = get_parallel()
-    # Migration indexes each rank's expert slots; statistics only sum counts.
-    if parallel.tp_size != parallel.moe_ep_size:
-        raise ValueError("NPU EPLB migration requires TP size to equal EP size.")
-    return get_eplb_device_group()
-
-
-def warmup_eplb_communication() -> None:
-    """Initialize statistics and all-peer migration channels before serving."""
-    global _warmed_device_group
-    group = _get_migration_group()
-    if group is _warmed_device_group:
+def _warmup_eplb_communication(group: dist.ProcessGroup | None) -> None:
+    """Warm the selected TP group's collective and peer channels once."""
+    resources = get_resources()
+    if group is None or group is resources.npu_eplb_warmed_group:
         return
-
-    start = time.perf_counter()
     world_size = dist.get_world_size(group)
     if world_size > 1:
         rank = dist.get_rank()
-        send = torch.zeros(1, dtype=torch.int32, device="npu")
-        recv = torch.empty((world_size, 1), dtype=torch.int32, device="npu")
+        send = torch.zeros(1, dtype=torch.int32, device=get_device().device)
+        recv = torch.empty((world_size, 1), dtype=torch.int32, device=send.device)
         dist.all_reduce(send, group=group)
+        # Pre-initialize every peer channel before serving; later migrations
+        # may involve only ranks that actually send or receive weights.
         ops = []
         for peer in range(world_size):
             if peer != rank:
@@ -80,14 +72,9 @@ def warmup_eplb_communication() -> None:
                 ops.append(dist.P2POp(dist.irecv, recv[peer], peer, group=group))
         for work in dist.batch_isend_irecv(ops):
             work.wait()
-        # Retain the tiny buffers until communication has actually completed.
+        # Keep the startup buffers alive until NPU communication completes.
         torch.npu.synchronize()
-    _warmed_device_group = group
-    logger.info(
-        "[NPU EPLB] communication warmup finished: ranks=%d time=%.3fs",
-        world_size,
-        time.perf_counter() - start,
-    )
+    resources.npu_eplb_warmed_group = group
 
 
 def update_expert_weights_with_staging(
@@ -114,8 +101,9 @@ def update_expert_weights_with_staging(
     staging_type = (
         _PhysicalExpertWeightStaging if is_npu_arch35() else _ExpertWeightStaging
     )
+    _validate_migration_topology()
     staging = staging_type(weights_by_layer, layer_ids, rank)
-    group = _get_migration_group()
+    group = get_eplb_group()
     world_size = dist.get_world_size()
     temp_buffers = []
     missing_experts_by_layer = {}
@@ -147,6 +135,15 @@ def update_expert_weights_with_staging(
         if missing_experts:
             missing_experts_by_layer[layer] = missing_experts
     return missing_experts_by_layer
+
+
+def _validate_migration_topology() -> None:
+    parallel = get_parallel()
+    if (
+        parallel.tp_size != parallel.moe_ep_size
+        or parallel.moe_ep_size != dist.get_world_size()
+    ):
+        raise ValueError("NPU EPLB migration requires TP size = EP size = WORLD size.")
 
 
 def _select_expert_weight_updates(old_metadata, new_metadata, layer_ids, rank):

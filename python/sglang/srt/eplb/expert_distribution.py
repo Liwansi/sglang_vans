@@ -257,6 +257,11 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
 
     @contextmanager
     def with_forward_pass(self, forward_pass_id: int, forward_batch: ForwardBatch):
+        # Target and draft share counters. Skip reset and append when a disabled
+        # region encloses this pass.
+        if self._disable_all:
+            yield {}
+            return
         outputs = {}
         with self._current_forward_pass_id.with_value(forward_pass_id):
             self._on_forward_pass_start(forward_batch)
