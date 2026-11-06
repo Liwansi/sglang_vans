@@ -36,19 +36,14 @@ logger = logging.getLogger(__name__)
 
 
 def get_eplb_group() -> dist.ProcessGroup | None:
-    """Return a compatible TP device group, or None to select default WORLD."""
+    """Use the TP device group by default; elastic EP retains WORLD."""
     if not dist.is_initialized():
+        raise RuntimeError("NPU EPLB requires distributed initialization.")
+    if get_exec().moe.elastic_ep_backend:
         return None
     tp_group = get_parallel().tp_group
-    # Placement maps, collective roots, and P2P peers use WORLD ranks. Reuse TP
-    # only with the same ordered members and backend; elastic EP keeps WORLD.
-    if (
-        get_exec().moe.elastic_ep_backend
-        or tp_group is None
-        or tp_group.ranks != list(range(dist.get_world_size()))
-        or dist.get_backend(tp_group.device_group) != dist.get_backend()
-    ):
-        return None
+    if tp_group is None:
+        raise RuntimeError("NPU EPLB requires an initialized TP group.")
     return tp_group.device_group
 
 
@@ -59,7 +54,7 @@ def _warmup_eplb_communication(group: dist.ProcessGroup | None) -> None:
         return
     world_size = dist.get_world_size(group)
     if world_size > 1:
-        rank = dist.get_rank()
+        rank = dist.get_rank(group)
         send = torch.zeros(1, dtype=torch.int32, device=get_device().device)
         recv = torch.empty((world_size, 1), dtype=torch.int32, device=send.device)
         dist.all_reduce(send, group=group)
@@ -68,6 +63,7 @@ def _warmup_eplb_communication(group: dist.ProcessGroup | None) -> None:
         ops = []
         for peer in range(world_size):
             if peer != rank:
+                peer = dist.get_global_rank(group, peer)
                 ops.append(dist.P2POp(dist.isend, send, peer, group=group))
                 ops.append(dist.P2POp(dist.irecv, recv[peer], peer, group=group))
         for work in dist.batch_isend_irecv(ops):
@@ -104,7 +100,19 @@ def update_expert_weights_with_staging(
     _validate_migration_topology()
     staging = staging_type(weights_by_layer, layer_ids, rank)
     group = get_eplb_group()
-    world_size = dist.get_world_size()
+    world_size = dist.get_world_size(group)
+    # The planner indexes TP-local ranks; preserve physical node boundaries.
+    global_ranks = (
+        dist.get_process_group_ranks(group)
+        if group is not None
+        else list(range(world_size))
+    )
+    ranks_per_node = dist.get_world_size() // nnodes
+    node_ids = [global_rank // ranks_per_node for global_rank in global_ranks]
+    node_counts = [node_ids.count(node) for node in sorted(set(node_ids))]
+    if len(set(node_counts)) != 1 or node_ids != sorted(node_ids):
+        raise ValueError("NPU EPLB requires equally sized, node-ordered TP partitions.")
+    num_gpu_per_node = node_counts[0]
     temp_buffers = []
     missing_experts_by_layer = {}
 
@@ -120,7 +128,7 @@ def update_expert_weights_with_staging(
             old_physical_to_logical_map=old_placement,
             new_physical_to_logical_map=new_placement,
             num_local_physical_experts=old_metadata.num_local_physical_experts,
-            num_gpu_per_node=world_size // nnodes,
+            num_gpu_per_node=num_gpu_per_node,
             rank=rank,
             world_size=world_size,
             missing_logical_experts_info=missing_experts,
@@ -141,9 +149,9 @@ def _validate_migration_topology() -> None:
     parallel = get_parallel()
     if (
         parallel.tp_size != parallel.moe_ep_size
-        or parallel.moe_ep_size != dist.get_world_size()
+        or parallel.moe_ep_size != dist.get_world_size(get_eplb_group())
     ):
-        raise ValueError("NPU EPLB migration requires TP size = EP size = WORLD size.")
+        raise ValueError("NPU EPLB migration requires TP size = EP size = EPLB group size.")
 
 
 def _select_expert_weight_updates(old_metadata, new_metadata, layer_ids, rank):

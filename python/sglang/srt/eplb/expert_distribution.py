@@ -755,6 +755,7 @@ _SINGLE_PASS_GATHERER_KEY_PRIMARY = "primary"
 class _Accumulator(ABC):
     # Backends may override this to select the statistics communication group.
     _communication_group: Optional[torch.distributed.ProcessGroup] = None
+    _communication_root: int = 0
 
     @staticmethod
     def init_new(
@@ -854,7 +855,7 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
         gpu_physical_count = gpu_physical_count.to(get_device_namespace().device)
         torch.distributed.reduce(
             gpu_physical_count,
-            dst=0,
+            dst=self._communication_root,
             op=torch.distributed.ReduceOp.SUM,
             group=self._communication_group,
         )
@@ -1070,7 +1071,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
                 device=get_device_namespace().device,
             )
         torch.distributed.broadcast(
-            avg_rate_tensor, src=0, group=self._communication_group
+            avg_rate_tensor, src=self._communication_root, group=self._communication_group
         )
         return avg_rate_tensor.item()
 

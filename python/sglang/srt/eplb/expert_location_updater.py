@@ -419,7 +419,11 @@ def update_expert_weights_single_layer(
                     P2POp(
                         op=torch.distributed.irecv,
                         tensor=_get_tensor(temp_buffers, i, dst_expert_location),
-                        peer=src_rank,
+                        peer=(
+                            torch.distributed.get_global_rank(group, src_rank)
+                            if group is not None
+                            else src_rank
+                        ),
                         group=group,
                     )
                     for i in range(num_tensors)
@@ -468,7 +472,11 @@ def update_expert_weights_single_layer(
                     P2POp(
                         op=torch.distributed.isend,
                         tensor=_get_tensor(send_weights, i, src_expert_location),
-                        peer=dst_rank,
+                        peer=(
+                            torch.distributed.get_global_rank(group, dst_rank)
+                            if group is not None
+                            else dst_rank
+                        ),
                         group=group,
                     )
                     for dst_rank in all_dst_ranks

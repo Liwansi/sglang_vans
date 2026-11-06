@@ -14,6 +14,8 @@
 
 """Ascend EPLB statistics and valid-route counting."""
 
+import torch.distributed as dist
+
 from sglang.srt.eplb.expert_distribution import (
     _ExpertDistributionRecorderReal,
     _SelectExpertsSinglePassGatherer,
@@ -34,6 +36,11 @@ class NpuExpertDistributionRecorder(_ExpertDistributionRecorderReal):
         if get_exec().moe.enable_eplb:
             _warmup_eplb_communication(group)
         self._accumulator._communication_group = group
+        self._accumulator._communication_root = (
+            dist.get_global_rank(group, 0) if group is not None else 0
+        )
+        # Shared accumulator root checks use rank zero in its communication group.
+        self._accumulator._rank = dist.get_rank(group)
 
     def _create_gatherer(self, expert_location_metadata, rank):
         moe = get_exec().moe
