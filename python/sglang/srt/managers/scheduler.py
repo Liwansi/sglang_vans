@@ -4591,7 +4591,7 @@ class Scheduler(
                         "adder_result",
                         result=res.name,
                         candidate_rid=req.rid,
-                        candidate_extend_tokens=req.extend_input_len,
+                        candidate_extend_tokens=req.extend_len,
                         candidate_admitted=(
                             bool(adder.can_run_list)
                             and req is adder.can_run_list[-1]

@@ -40,7 +40,7 @@ class PrefillBatchDebug:
                 remaining_current_tokens=adder.cur_rem_tokens,
                 chunk_continues=adder.new_chunked_req is not None,
                 selected_extend_tokens=[
-                    req.extend_input_len for req in adder.can_run_list
+                    req.extend_len for req in adder.can_run_list
                 ],
             )
         logger.info(
