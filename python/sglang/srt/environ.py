@@ -353,6 +353,8 @@ class Envs:
     # Logging
     # ===================================================================
     SGLANG_ENABLE_PD_TIMING_LOG = EnvBool(False)
+    # Prefill admission diagnostics, independent of per-request PD timing logs.
+    SGLANG_ENABLE_PREFILL_BATCH_DEBUG = EnvBool(False)
     SGLANG_LOG_GC = EnvBool(False)
     SGLANG_LOG_FORWARD_ITERS = EnvBool(False)
     SGLANG_LOG_DECODE_GRAPH_KEY = EnvBool(False)

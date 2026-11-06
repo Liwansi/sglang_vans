@@ -345,6 +345,7 @@ from sglang.srt.models.unlimited_ocr_v2_support.scheduler_runtime import (
     UocrSchedulerRuntime,
 )
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
+from sglang.srt.observability.prefill_batch_debug import PrefillBatchDebug
 from sglang.srt.observability.req_time_stats import (
     flush_trace_batch,
     set_schedule_time_batch,
@@ -4318,6 +4319,28 @@ class Scheduler(
             return None, running_batch
 
         running_bs = len(running_batch.reqs)
+        batch_debug = None
+        if (
+            get_disagg().disaggregation_mode == "prefill"
+            and envs.SGLANG_ENABLE_PREFILL_BATCH_DEBUG.get()
+        ):
+            batch_debug = PrefillBatchDebug(
+                waiting_requests=len(self.waiting_queue),
+                bootstrap_requests=len(self.disagg_prefill_bootstrap_queue.queue),
+                transfer_requests=len(self.disagg_prefill_transfer_queue),
+                launched_requests=len(self.prefill_launched_reqs),
+                running_requests=running_bs,
+                free_request_slots_before=self.req_to_token_pool.available_size(),
+                request_pool_capacity=self.req_to_token_pool.size,
+                max_running_requests=self.max_running_requests,
+                pp_size=get_parallel().pp_size,
+                pp_async_batch_depth=get_parallel().pp_async_batch_depth,
+                pp_micro_batch_limit=get_parallel().pp_max_micro_batch_size,
+                prefill_request_limit=get_schedule().prefill_max_requests,
+                chunk_token_limit=self.chunked_prefill_size,
+                input_token_limit=self.max_prefill_tokens,
+                continuing_chunk=self.chunked_req is not None,
+            )
         # Skipped during a chunked prefill: that pass must proceed regardless.
         if (
             self.min_free_slots_delayer is not None
@@ -4329,6 +4352,11 @@ class Scheduler(
                 ),
             )
         ):
+            if batch_debug is not None:
+                batch_debug.stop("min_free_slots_delayer")
+                batch_debug.emit(
+                    free_request_slots=self.req_to_token_pool.available_size()
+                )
             return None, running_batch
 
         num_allocatable_reqs = self.get_num_allocatable_reqs(
@@ -4351,6 +4379,13 @@ class Scheduler(
             and not self.enable_priority_preemption
         ):
             running_batch.batch_is_full = True
+            if batch_debug is not None:
+                batch_debug.stop(
+                    "no_allocatable_requests", allocatable_requests=num_allocatable_reqs
+                )
+                batch_debug.emit(
+                    free_request_slots=self.req_to_token_pool.available_size()
+                )
             return None, running_batch
 
         # Get priority queue
@@ -4452,8 +4487,12 @@ class Scheduler(
             # A spent pass budget admits no one, even before the first
             # candidate: the resumed chunk or mixed decode rows can spend it.
             if adder.budget_state() == AddReqResult.OTHER:
+                if batch_debug is not None:
+                    batch_debug.stop("adder_pass_budget", candidate_rid=req.rid)
                 break
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
+                if batch_debug is not None:
+                    batch_debug.skip("lora_not_ready")
                 continue
 
             # A forward batch runs one pooling mode, so setwise readout requests
@@ -4463,6 +4502,8 @@ class Scheduler(
                 (req.token_indices_to_pool is not None)
                 != (adder.can_run_list[0].token_indices_to_pool is not None)
             ):
+                if batch_debug is not None:
+                    batch_debug.skip("pooling_mode_mismatch")
                 continue
 
             running_bs = len(running_batch.reqs)
@@ -4470,18 +4511,29 @@ class Scheduler(
                 req.beam_group.beam_width if req.beam_group is not None else None
             )
             num_held_rows = sum(r.kv.holds_kv for r in adder.can_run_list)
-            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(
+            candidate_allocatable_reqs = self.get_num_allocatable_reqs(
                 running_bs,
                 candidate_beam_width,
                 running_batch=running_batch,
                 num_held_rows=num_held_rows,
-            ):
+            )
+            if len(adder.can_run_list) >= candidate_allocatable_reqs:
                 running_batch.batch_is_full = True
 
             if running_batch.batch_is_full:
                 if not self.enable_priority_preemption or not adder.preempt_to_schedule(
                     req
                 ):
+                    if batch_debug is not None:
+                        batch_debug.stop(
+                            "request_capacity",
+                            candidate_rid=req.rid,
+                            allocatable_requests=candidate_allocatable_reqs,
+                            pp_remaining=get_parallel().pp_max_micro_batch_size
+                            - running_bs,
+                            free_request_slots=self.req_to_token_pool.available_size(),
+                            held_rows=num_held_rows,
+                        )
                     break
 
             if self.enable_hicache_storage or self.enable_lmcache:
@@ -4491,6 +4543,8 @@ class Scheduler(
                 req.time_stats.observe_storage_prefetch_ready(prefetch_done)
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
+                    if batch_debug is not None:
+                        batch_debug.skip("storage_prefetch_pending")
                     continue
                 # Pop the L3-loaded span. Unified cache exposes its absolute
                 # start so cache-mode L2/L3 attribution survives L3-tail eviction.
@@ -4506,15 +4560,21 @@ class Scheduler(
 
             req.init_next_round_input(self.tree_cache)
             if adder.should_defer(req):
+                if batch_debug is not None:
+                    batch_debug.stop("adder_defer", candidate_rid=req.rid)
                 break
             if self.enable_hicache_storage and (
                 self._prefetch_after_device_hit_loss(req)
             ):
+                if batch_debug is not None:
+                    batch_debug.skip("storage_prefetch_retry")
                 continue
             if self.enable_hicache_storage and buffer_pipeline is not None:
                 staging_ready = buffer_pipeline.prepare_staged_prefetch(req)
                 req.time_stats.observe_storage_staging_ready(staging_ready)
                 if not staging_ready:
+                    if batch_debug is not None:
+                        batch_debug.skip("storage_staging_pending")
                     continue
             res = adder.add_one_req(
                 req,
@@ -4526,6 +4586,21 @@ class Scheduler(
                 running_loras.add(req.lora_id)
 
             if res != AddReqResult.CONTINUE:
+                if batch_debug is not None:
+                    batch_debug.stop(
+                        "adder_result",
+                        result=res.name,
+                        candidate_rid=req.rid,
+                        candidate_extend_tokens=req.extend_input_len,
+                        candidate_admitted=(
+                            bool(adder.can_run_list)
+                            and req is adder.can_run_list[-1]
+                        ),
+                        prefill_request_limit_reached=(
+                            adder.prefill_max_requests is not None
+                            and len(adder.can_run_list) >= adder.prefill_max_requests
+                        ),
+                    )
                 if res == AddReqResult.NO_TOKEN:
                     running_batch.batch_is_full = adder.batch_is_full_after_rejection(
                         req
@@ -4546,6 +4621,10 @@ class Scheduler(
                         ).release_state_slot(req)
                 break
 
+        if batch_debug is not None:
+            batch_debug.emit(
+                free_request_slots=self.req_to_token_pool.available_size(), adder=adder
+            )
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_end()
         self.running_reqs.leave(adder.preempt_list)
