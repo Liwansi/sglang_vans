@@ -435,7 +435,7 @@ class AscendOpsDispatcher(BaseDispatcher):
     def _dispatch_allgather(self, hidden_states, topk_weights, topk_ids, group):
         """Gather the full batch on every TP rank."""
         input_dtype = hidden_states.dtype
-        quant_mode = self._quant_mode("routing")
+        quant_mode = self._quant_mode("routing", "low_latency")
         if quant_mode not in (-1, INT8_QUANT_MODE, MXFP8_QUANT_MODE):
             raise NotImplementedError(
                 "NPU AllGather supports BF16, INT8 and MXFP8 routing"
@@ -533,7 +533,6 @@ class AscendOpsDispatcher(BaseDispatcher):
             )
 
         scales = None
-        quant_mode = MXFP8_QUANT_MODE
         if quant_mode == MXFP8_QUANT_MODE:
             if hidden_states.shape[0] > 0:
                 hidden_states, scales = torch_npu.npu_dynamic_mx_quant(
