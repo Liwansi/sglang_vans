@@ -33,6 +33,7 @@ class PrefillBatchDebug:
         if adder is not None:
             record.update(
                 selected_requests=len(adder.can_run_list),
+                policy_stop=getattr(adder, "admission_debug", {}),
                 remaining_input_tokens=adder.rem_input_tokens,
                 remaining_chunk_tokens=adder.rem_chunk_tokens,
                 remaining_total_tokens=adder.rem_total_tokens,
