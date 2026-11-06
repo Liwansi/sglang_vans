@@ -167,6 +167,7 @@ class MoeRowTransport(ComputeTransport):
                     moe_a2a_backend.is_deepep()
                     or moe_a2a_backend.is_megamoe()
                     or moe_a2a_backend.is_mori()
+                    or moe_a2a_backend.is_ascend_ops()
                 ), (
                     "CP requires moe_a2a_backend in ('deepep', 'megamoe', 'mori'), "
                     f"got {moe_a2a_backend.value!r}."
