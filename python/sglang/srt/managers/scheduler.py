@@ -4114,6 +4114,28 @@ class Scheduler(
         if self.dllm_config is not None:
             self.dllm_manager.filter_finished_reqs()
 
+        # Skip admission work only when idle is a local decision. DP attention
+        # and the prefill delayer must still participate in their collectives.
+        idle_fast_path = (
+            not self.require_mlp_sync
+            and self.prefill_delayer is None
+            and running_batch.is_empty()
+            and self.chunked_req is None
+            and (last_batch is None or not last_batch.forward_mode.is_extend())
+            and not self.waiting_queue
+            and self.dllm_config is None
+            and not self.enable_hisparse
+            and not self.grammar_manager.has_waiting_grammars()
+            and not self.enable_hierarchical_cache
+        )
+        if idle_fast_path:
+            running_batch.batch_is_full = False
+            # Preserve the normal path's reset of the decode-only interval.
+            self._should_defer_prefill(running_batch)
+            return self._finalize_next_batch_plan(
+                None, running_batch, need_mlp_sync=False
+            )
+
         # Merge the prefill batch into the running batch
         reqs_to_exclude = set()
 
@@ -4222,6 +4244,17 @@ class Scheduler(
             else:
                 ret = None
 
+        return self._finalize_next_batch_plan(
+            ret, running_batch, need_mlp_sync=need_mlp_sync
+        )
+
+    def _finalize_next_batch_plan(
+        self,
+        ret: Optional[ScheduleBatch],
+        running_batch: ScheduleBatch,
+        *,
+        need_mlp_sync: bool,
+    ) -> NextBatchPlan:
         # Handle DP attention and log stats
         ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
             ret, need_sync=need_mlp_sync
