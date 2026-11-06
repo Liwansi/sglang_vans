@@ -63,9 +63,11 @@ def _warmup_eplb_communication(group: dist.ProcessGroup | None) -> None:
         ops = []
         for peer in range(world_size):
             if peer != rank:
-                peer = dist.get_global_rank(group, peer)
-                ops.append(dist.P2POp(dist.isend, send, peer, group=group))
-                ops.append(dist.P2POp(dist.irecv, recv[peer], peer, group=group))
+                global_peer = dist.get_global_rank(group, peer)
+                ops.append(dist.P2POp(dist.isend, send, global_peer, group=group))
+                ops.append(
+                    dist.P2POp(dist.irecv, recv[peer], global_peer, group=group)
+                )
         for work in dist.batch_isend_irecv(ops):
             work.wait()
         # Keep the startup buffers alive until NPU communication completes.
