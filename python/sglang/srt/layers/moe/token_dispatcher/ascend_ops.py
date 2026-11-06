@@ -27,6 +27,7 @@ from sglang.srt.layers.dp_attention import (
     get_is_extend_in_batch,
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.cp.utils import get_cp_global_num_tokens
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
@@ -441,6 +442,7 @@ class AscendOpsDispatcher(BaseDispatcher):
             )
         parallel = get_parallel()
         global_rows = get_dp_global_num_tokens()
+        cp_rows = get_cp_global_num_tokens()
         if (
             is_dp_attention_enabled()
             and parallel.attn_cp_size == 1
@@ -473,9 +475,35 @@ class AscendOpsDispatcher(BaseDispatcher):
                     f"rank has {hidden_states.shape[0]}, "
                     f"expected {row_sizes[rank]}"
                 )
+        elif cp_rows is not None:
+            # Prefill-CP metadata already contains the physical rows used by
+            # the CP collective. Reuse it instead of launching a row-count
+            # all_gather. ``actual`` includes CP padding; logical rows do not.
+            # CP metadata is published while preparing the forward batch. It
+            # is available to eager NPU execution without relying on the
+            # CUDA-graph ForwardBatch ContextVar.
+            if cp_rows is not None:
+                if len(cp_rows) != dist.get_world_size(group):
+                    raise ValueError(
+                        "Ascend Ops CP token metadata does not match the "
+                        f"AllGather group: metadata has {len(cp_rows)} rows, "
+                        f"group size={dist.get_world_size(group)}"
+                    )
+                row_sizes = [int(rows) for rows in cp_rows]
+                rank = dist.get_rank(group)
+                if row_sizes[rank] != hidden_states.shape[0]:
+                    raise ValueError(
+                        "Ascend Ops local rows disagree with CP token metadata: "
+                        f"rank has {hidden_states.shape[0]}, "
+                        f"expected {row_sizes[rank]}"
+                    )
+            else:
+                # Keep a compatibility fallback for callers that do not have
+                # CP metadata (for example, isolated unit-test dispatches).
+                row_sizes = self._allgather_row_sizes(
+                    hidden_states.shape[0], group, hidden_states.device
+                )
         else:
-            # CP can create interleaved/zigzag local row counts, so the DP
-            # metadata is insufficient there. Exchange the exact local count.
             row_sizes = self._allgather_row_sizes(
                 hidden_states.shape[0], group, hidden_states.device
             )
@@ -505,6 +533,7 @@ class AscendOpsDispatcher(BaseDispatcher):
             )
 
         scales = None
+        quant_mode = MXFP8_QUANT_MODE
         if quant_mode == MXFP8_QUANT_MODE:
             if hidden_states.shape[0] > 0:
                 hidden_states, scales = torch_npu.npu_dynamic_mx_quant(

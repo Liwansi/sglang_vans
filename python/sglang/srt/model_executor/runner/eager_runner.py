@@ -32,6 +32,7 @@ from sglang.srt.layers.cp.utils import (
     get_cp_strategy,
     is_cp_active,
     prepare_cp_forward,
+    set_cp_forward_metadata,
 )
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
@@ -260,6 +261,10 @@ class EagerRunner(BaseRunner):
 
         forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
 
+        # Clear the process-level CP layout before evaluating this batch.  A
+        # previous CP request must not make a later non-CP request look active
+        # to eager NPU MoE dispatch.
+        set_cp_forward_metadata(None)
         cp_active = is_cp_active(forward_batch)
         if cp_active:
             prepare_cp_forward(forward_batch)

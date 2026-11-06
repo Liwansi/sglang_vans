@@ -44,6 +44,27 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
+# The CP row layout is prepared before model execution.  Keep the metadata
+# published at the same process level as DP's gathered token counts so eager
+# NPU MoE dispatch does not need to depend on the ForwardBatch ContextVar.
+_cp_forward_metadata: Optional[BaseContextParallelMetadata] = None
+
+
+def set_cp_forward_metadata(metadata: Optional[BaseContextParallelMetadata]) -> None:
+    global _cp_forward_metadata
+    _cp_forward_metadata = metadata
+
+
+def get_cp_global_num_tokens() -> Optional[list[int]]:
+    """Return the current CP rank row counts without communication."""
+    metadata = _cp_forward_metadata
+    if metadata is None:
+        return None
+    return getattr(metadata, "per_rank_actual_token", None) or getattr(
+        metadata, "per_rank_logical_token", None
+    )
+
+
 def get_cp_sharded_padded(value):
     """Convert a global KV count to local storage for sharded CP storage."""
     strategy = get_cp_strategy()
@@ -287,6 +308,8 @@ def prepare_cp_forward(forward_batch) -> None:
             extend_seqs_len=extend_lens_cpu,
         )
         pad_logical_token_to_physical(forward_batch.attn_cp_metadata)
+
+    set_cp_forward_metadata(forward_batch.attn_cp_metadata)
 
     # Under CP-TP group sharing the model owns the CP row layout and gathers
     # full rows for its MLPs, so their buffers keep the full-batch length.
