@@ -180,6 +180,28 @@ class BudgetPlan:
             if n.startswith("prefill_")
         )
         self.adapter_bytes = sum(s.nbytes for s in self.adapter_buffers.values())
+        self.plan_state_bytes = 0
+        self.plan_scratch_bytes = 0
+        if packed_c8:
+            # Each supported query width owns a persistent Plan cache.  Decode
+            # width 1 can alternate with the configured MTP verify width.
+            state_rows = resident_rows + batch_capacity
+            widths = {1, max_query_width}
+            for width in widths:
+                plan_capacity = 8192 if width == 4 else 4096
+                self.plan_state_bytes += (
+                    num_layers
+                    * state_rows
+                    * width
+                    * (8 + 2 * plan_capacity * 4 + 4)
+                )
+            # State gather/scatter plus the Plan outputs and miss-first
+            # conversion coexist for one forward on the device.
+            self.plan_scratch_bytes = (
+                batch_capacity
+                * max_query_width
+                * (2 * cache_tokens * 4 + 32 * top_k + 4096)
+            )
         self.host_token_capacity = None
         self.host_kv_spec = None
 
@@ -192,6 +214,8 @@ class BudgetPlan:
             + self.output_scratch_bytes
             + self.prefill_workspace_bytes
             + self.adapter_bytes
+            + self.plan_state_bytes
+            + self.plan_scratch_bytes
         )
 
     @property
@@ -272,6 +296,8 @@ def resolve_sparse_kv_budget(
     ):
         raise ValueError("Invalid native LIM query geometry.")
     if packed_c8:
+        if max_query_width not in (1, 2, 4):
+            raise ValueError("A5 C8 Ordered+Plan supports query width 1, 2 or 4.")
         if (
             (kv_lora_rank, qk_rope_head_dim, index_head_dim, page_size, top_k)
             != (512, 64, 128, 128, 2048)
@@ -286,7 +312,14 @@ def resolve_sparse_kv_budget(
         or kv_bytes_per_token != (kv_lora_rank + qk_rope_head_dim) * kv_dtype.itemsize
     ):
         raise ValueError("Native LIM requires BF16 MLA KV storage.")
-    capacity = cache_tokens or max_query_width * top_k
+    # SparseKvPlan has fixed geometry: 4096 slots for 1/2 query rows and
+    # 8192 slots for 4.  The physical C8 row must accommodate the widest path.
+    plan_capacity = 8192 if max_query_width == 4 else 4096
+    if packed_c8 and cache_tokens and cache_tokens != plan_capacity:
+        raise ValueError(
+            f"A5 C8 Ordered+Plan requires cache_tokens={plan_capacity}."
+        )
+    capacity = plan_capacity if packed_c8 else (cache_tokens or max_query_width * top_k)
     if (
         capacity < max_query_width * top_k
         or capacity + page_size > MISS_CAPACITY

@@ -1,8 +1,11 @@
-"""Ascend950 payload and FP8 indexer adapters for the shared offload manager."""
+"""Ascend950 packed payload, ordered indexer and sparse KV plan adapters."""
+
+from importlib import import_module
 
 import torch
 from sgl_kernel_npu.sparsity_driven_kv_offload import unidex_copy_inplace
 
+from sglang.kernels.ops.attention.npu_sparse_kv_plan import SparseKvPlanOp
 from sglang.kernels.ops.kvcache.npu_sparse_kv import prepare_sparse_kv_rows
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_budget import (
     C8_ROW_BYTES,
@@ -19,6 +22,9 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.memfabric_pool i
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.npu_lim_copy_sfa_metadata import (
     prepare_copy_sfa_metadata,
+)
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.npu_plan_copy_sfa_metadata import (
+    plan_to_copy_sfa,
 )
 from sglang.srt.runtime_context import get_parallel
 
@@ -46,14 +52,91 @@ class PackedMemFabricKVPool(MemFabricKVPool):
 
 
 class C8DecodeAdapter(LIMDecodeAdapter):
+    """Convert the ordered indexer/Plan outputs to the existing Copy-SFA ABI."""
+
+    def __init__(self, manager):
+        super().__init__(manager)
+        self.plan_operator = SparseKvPlanOp()
+        self._states = {}
+        # Device scalars are updated inside captured graphs as well as eager
+        # forwards. A width change invalidates the other width's cache state.
+        self._width_epochs = torch.zeros(
+            (manager.layer_num,), dtype=torch.int64, device=manager.device
+        )
+        self._last_widths = torch.zeros(
+            (manager.layer_num,), dtype=torch.int32, device=manager.device
+        )
+
     @staticmethod
     def _load_operator():
-        operator = getattr(
-            torch.ops.npu, "fused_quant_lightning_indexer_manage_full_visible", None
+        for package in (
+            "cann_ops_transformer_sparsekvplan",
+            "cann_ops_transformer_qliorder",
+        ):
+            try:
+                module = import_module(
+                    f"{package}.ops.attention.quant_lightning_indexer_ordered"
+                )
+            except ImportError:
+                continue
+            return module.quant_lightning_indexer_ordered
+        raise RuntimeError(
+            "A5 C8 Ordered+Plan requires the QuantLightningIndexerOrdered Torch "
+            "wheel (cann_ops_transformer_sparsekvplan or cann_ops_transformer_qliorder)."
         )
-        if operator is None:
-            raise RuntimeError("A5 C8 requires the paired fully visible LIM wheel.")
-        return operator
+
+    def _state(self, manager, layer, width):
+        key = (layer, width)
+        if key not in self._states:
+            capacity = 8192 if width == 4 else 4096
+            # Batch rows are gathered by stable resident slot before each Plan
+            # launch. Extra rows give graph padding a unique scratch identity.
+            count = (manager.budget.resident_rows + manager.batch_capacity) * width
+            device = manager.device
+            self._states[key] = (
+                torch.full((count,), -1, dtype=torch.int64, device=device),
+                torch.full((count, capacity), -1, dtype=torch.int32, device=device),
+                torch.arange(capacity, dtype=torch.int32, device=device)
+                .expand(count, -1)
+                .clone(),
+                torch.zeros((count,), dtype=torch.int32, device=device),
+            )
+        return self._states[key]
+
+    def reset_requests(self, resident_slots):
+        super().reset_requests(resident_slots)
+        for layer in {layer for layer, _ in self._states}:
+            self._reset_layer_state(layer, resident_slots)
+
+    def reset_layer_requests(self, layer, resident_slots):
+        self.last_prefix[layer].index_fill_(0, resident_slots, -1)
+        self._reset_layer_state(layer, resident_slots)
+
+    def _reset_layer_state(self, layer, resident_slots):
+        for (state_layer, width), (
+            last_ids,
+            slot_to_token,
+            lru_slots,
+            row_modes,
+        ) in self._states.items():
+            if state_layer != layer:
+                continue
+            indices = (
+                resident_slots.long()[:, None] * width
+                + torch.arange(width, device=resident_slots.device)[None, :]
+            ).reshape(-1)
+            last_ids.index_fill_(0, indices, -1)
+            slot_to_token.index_fill_(0, indices, -1)
+            lru_slots.index_copy_(
+                0,
+                indices,
+                torch.arange(
+                    lru_slots.shape[1],
+                    device=resident_slots.device,
+                    dtype=torch.int32,
+                ).expand(indices.numel(), -1),
+            )
+            row_modes.index_fill_(0, indices, 0)
 
     def select(
         self,
@@ -70,29 +153,155 @@ class C8DecodeAdapter(LIMDecodeAdapter):
     ):
         layer = layer_id - manager.start_layer
         batch, width = self.prepare(manager, block_table, forward_batch, layer)
+        if width not in (1, 2, 4):
+            raise ValueError("SparseKvPlan supports only 1, 2 or 4 query rows/request")
         rows = batch * width
-        self.operator(
-            query=query[:rows].contiguous(),
-            weights=weights[:rows],
-            key=key,
-            query_scale=query_scale[:rows].contiguous(),
-            key_scale=key_scale,
-            block_table=self.block_table[:batch],
-            query_ends=self.query_ends[width - 1, :batch],
-            lengths=self._pre_lengths[:batch],
-            cache_tokens=self._pre_cache_sizes[:batch],
-            request_state=self._pre_states[:batch],
-            pool_entries=self.resident_safe_slots[:batch],
-            slot_pool=manager.device_slot_map[layer],
-            topk_sources=self.source_ids[:rows],
-            topk_slots=self.device_slots[:rows],
-            topk_miss_counts=self.topk_misses[:rows],
-            miss_sources=self.miss_sources[:batch],
-            miss_slots=self.miss_slots[:batch],
-            miss_counts=self.miss_counts[:batch],
+        capacity = 8192 if width == 4 else 4096
+        if manager.cache_capacity < capacity:
+            raise ValueError(
+                "The C8 resident KV allocation is smaller than SparseKvPlan requires"
+            )
+        # A max-width-4 pool has 8192 physical slots, but decode and width-2
+        # Plan runs manage only the first 4096. Keep Copy-SFA's per-request
+        # cache size and sparse/short decision consistent with that Plan run.
+        sparse = self._pre_valid[:batch] & (self._pre_lengths[:batch] >= capacity)
+        self._pre_sparse[:batch].copy_(sparse)
+        self._pre_cache_sizes[:batch].copy_(
+            torch.where(sparse, capacity, 0).to(torch.int32)
         )
-        # This metadata belongs to the shared LIM plan.  Prepare it once on the
-        # owner layer so IndexShare consumers can submit CopySFA directly.
+        self._pre_next_prefix[:batch].copy_(
+            torch.where(sparse, self._pre_lengths[:batch], -1)
+        )
+        index_lengths = torch.where(
+            self._pre_valid[:batch], self._pre_lengths[:batch], 1
+        ).to(torch.int32)
+        self.block_table[:batch].masked_fill_(
+            ~self._pre_valid[:batch, None], 0
+        )
+        ordered = self.operator(
+            query=query[:rows].contiguous(),
+            key=key,
+            weights=weights[:rows].contiguous(),
+            query_dequant_scale=query_scale[:rows].contiguous(),
+            key_dequant_scale=key_scale,
+            actual_seq_lengths_query=self.query_ends[width - 1, :batch],
+            actual_seq_lengths_key=index_lengths,
+            block_table=self.block_table[:batch],
+            layout_query="TND",
+            layout_key="PA_BSND",
+            sparse_count=manager.sparse_topk,
+            sparse_mode=3,
+            query_quant_mode=0,
+            key_quant_mode=0,
+        )
+        source_ids = ordered.squeeze(1).contiguous()
+        source_ids = torch.where(
+            self._pre_valid[:batch].repeat_interleave(width)[:, None],
+            source_ids,
+            -1,
+        )
+        epoch = self._width_epochs[layer] + (self._last_widths[layer] != width).long()
+        self._width_epochs[layer].copy_(epoch)
+        self._last_widths[layer].fill_(width)
+        persistent = self._state(manager, layer, width)
+        safe_resident = torch.where(
+            self._pre_valid[:batch],
+            self.resident_safe_slots[:batch],
+            torch.arange(batch, device=query.device, dtype=torch.int32)
+            + manager.budget.resident_rows,
+        ).long()
+        state_rows = (
+            safe_resident[:, None] * width
+            + torch.arange(width, device=query.device)[None, :]
+        ).reshape(-1)
+        last_ids, slots, lru, modes = (
+            value.index_select(0, state_rows) for value in persistent
+        )
+        old_prefix = self.last_prefix[layer].index_select(
+            0, self.resident_safe_slots[:batch].long()
+        )
+        visible = torch.where(
+            self._pre_valid[:batch].repeat_interleave(width),
+            forward_batch.positions[:rows].to(torch.int32) + 1,
+            0,
+        ).contiguous()
+        if width > 1:
+            first_position = forward_batch.positions[:rows:width].to(torch.int32)
+            old_prefix = old_prefix.minimum(first_position)
+        stable = (
+            old_prefix.clamp_min(0)
+            .repeat_interleave(width)
+            .minimum(visible)
+            .contiguous()
+        )
+        current_slots = torch.empty_like(source_ids)
+        miss_count = torch.empty((rows,), dtype=torch.int32, device=query.device)
+        miss_tokens = torch.empty_like(source_ids)
+        miss_slots = torch.empty_like(source_ids)
+        status = torch.full(
+            (rows * 1024,),
+            torch.iinfo(torch.int32).max,
+            dtype=torch.int32,
+            device=query.device,
+        )
+        resident_rows = torch.empty((rows,), dtype=torch.int32, device=query.device)
+        resident_table = torch.empty(
+            (rows, capacity // manager.page_size), dtype=torch.int32, device=query.device
+        )
+        req_ids = self.request_safe_slots[:batch].long() + epoch * manager.size
+        self.plan_operator(
+            (
+                req_ids.contiguous(),
+                source_ids,
+                stable,
+                visible,
+                torch.arange(batch, device=query.device, dtype=torch.int32)
+                .repeat_interleave(width)
+                .contiguous(),
+                torch.full((1,), rows, dtype=torch.int32, device=query.device),
+            ),
+            (
+                last_ids,
+                slots,
+                lru,
+                current_slots,
+                miss_count,
+                miss_tokens,
+                miss_slots,
+                status,
+                modes,
+                resident_rows,
+                resident_table,
+            ),
+            capacity=capacity,
+            max_token=manager.logical_max_context_len,
+            block_size=manager.page_size,
+        )
+        # Keep device-side diagnostics available without a per-token D2H sync.
+        self.last_plan_status = status[:rows]
+        self.last_plan_modes = modes
+        for destination, value in zip(persistent, (last_ids, slots, lru, modes)):
+            destination.index_copy_(0, state_rows, value)
+        (
+            sorted_sources,
+            sorted_slots,
+            topk_misses,
+            misses,
+            miss_destinations,
+            miss_counts,
+        ) = plan_to_copy_sfa(
+            source_ids, current_slots, miss_count, miss_tokens, miss_slots, width
+        )
+        self.source_ids[:rows].copy_(sorted_sources)
+        self.device_slots[:rows].copy_(sorted_slots)
+        self.topk_misses[:rows].copy_(topk_misses)
+        self.miss_sources[:batch].fill_(-1)
+        self.miss_slots[:batch].fill_(-1)
+        self.miss_sources[:batch, : width * manager.sparse_topk].copy_(misses)
+        self.miss_slots[:batch, : width * manager.sparse_topk].copy_(
+            miss_destinations
+        )
+        self.miss_counts[:batch].copy_(miss_counts)
         prepare_copy_sfa_metadata(
             source_ids=self.source_ids[:rows],
             valid_rows=self._pre_valid[:batch],
@@ -100,7 +309,7 @@ class C8DecodeAdapter(LIMDecodeAdapter):
             request_slots=self.resident_safe_slots[:batch],
             actual_seq_lengths_kv=self._pre_lengths[:batch],
             hbm_block_table=manager.planner_hbm_block_table[:batch],
-            capacity=self.capacity,
+            capacity=capacity,
             query_width=width,
             hbm_row_offset=1,
         )
@@ -185,7 +394,7 @@ class C8SparseKVCacheManager(FusedSparseKVCacheManager):
             requests = forward_batch.req_pool_indices.long()
             self.resident_end[layer_index].index_fill_(0, requests, -1)
             if self.request_to_resident is None:
-                self.lim_adapter.last_prefix[layer_index].index_fill_(0, requests, -1)
+                self.lim_adapter.reset_layer_requests(layer_index, requests)
         return current, positions, valid
 
     def copy_sfa_attention(self, layer, query_nope, query_rope, plan, current_inputs):
