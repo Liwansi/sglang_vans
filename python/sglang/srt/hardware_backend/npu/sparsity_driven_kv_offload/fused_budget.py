@@ -64,6 +64,8 @@ class BudgetPlan:
         prefill_workspace_tokens: int = 0,
         resident_rows: int | None = None,
         packed_c8: bool = False,
+        cache_layers: int | None = None,
+        plan_layers: int | None = None,
     ) -> None:
         resident_rows = request_rows if resident_rows is None else resident_rows
         if not 1 <= resident_rows <= request_rows:
@@ -73,6 +75,8 @@ class BudgetPlan:
         self.packed_c8 = packed_c8
         self.context_len = context_len
         self.num_layers = num_layers
+        self.cache_layers = num_layers if cache_layers is None else cache_layers
+        self.plan_layers = num_layers if plan_layers is None else plan_layers
         self.top_k = top_k
         self.kv_dtype = kv_dtype
         self.copy_sfa_query_heads = copy_sfa_query_heads
@@ -88,7 +92,7 @@ class BudgetPlan:
             "device_kv_buffer": BufferSpec(
                 (resident_rows, cache_tokens, 1, kv_lora_rank),
                 kv_dtype,
-                num_layers,
+                self.cache_layers,
             ),
             "device_rope_buffer": BufferSpec(
                 (resident_rows, cache_tokens, 1, qk_rope_head_dim),
@@ -110,7 +114,7 @@ class BudgetPlan:
             self.manager_buffers["device_kv_buffer"] = BufferSpec(
                 (resident_rows - 1, cache_tokens, 1, C8_ROW_BYTES),
                 torch.int8,
-                num_layers,
+                self.cache_layers,
             )
             del self.manager_buffers["device_rope_buffer"]
         if resident_rows < request_rows:
@@ -190,7 +194,7 @@ class BudgetPlan:
             for width in widths:
                 plan_capacity = 8192 if width == 4 else 4096
                 self.plan_state_bytes += (
-                    num_layers
+                    self.plan_layers
                     * state_rows
                     * width
                     * (8 + 2 * plan_capacity * 4 + 4)
@@ -216,6 +220,11 @@ class BudgetPlan:
             + self.adapter_bytes
             + self.plan_state_bytes
             + self.plan_scratch_bytes
+            + (
+                self.plan_layers * self.page_size * C8_ROW_BYTES
+                if self.packed_c8
+                else 0
+            )
         )
 
     @property
@@ -261,7 +270,7 @@ class BudgetPlan:
                 C8_ROW_BYTES if self.packed_c8 else self.kv_cache_dim,
             ),
             torch.int8 if self.packed_c8 else self.kv_dtype,
-            self.num_layers,
+            self.cache_layers if self.packed_c8 else self.num_layers,
         )
         return self
 
@@ -283,6 +292,7 @@ def resolve_sparse_kv_budget(
     graph_batch_capacity: int = 0,
     prefill_workspace_tokens: int = 0,
     resident_rows: int | None = None,
+    indexer_layer_ids: tuple[int, ...] | None = None,
 ) -> BudgetPlan:
     """Resolve and validate native persistent allocations before pool sizing."""
     kv_lora_rank = model_config.kv_lora_rank
@@ -345,6 +355,12 @@ def resolve_sparse_kv_budget(
         qk_rope_head_dim=qk_rope_head_dim,
         index_head_dim=index_head_dim,
         packed_c8=packed_c8,
+        cache_layers=(num_layers - len(indexer_layer_ids))
+        if packed_c8 and indexer_layer_ids is not None
+        else None,
+        plan_layers=len(indexer_layer_ids)
+        if packed_c8 and indexer_layer_ids is not None
+        else None,
     )
     base = BudgetPlan(**plan_options)
     workspace_bytes = sum(

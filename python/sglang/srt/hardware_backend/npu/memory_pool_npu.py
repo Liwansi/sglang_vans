@@ -913,6 +913,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 kv_size_bytes += get_tensor_size_bytes(index_k_cache)
         if self.index_k_scale_buffer is not None:
             kv_size_bytes += get_tensor_size_bytes(self.index_k_scale_buffer)
+        manager = getattr(self, "sparse_kv_manager", None)
+        if getattr(manager, "packed_c8", False):
+            kv_size_bytes += get_tensor_size_bytes(manager.full_hbm_kv_buffer)
         return kv_size_bytes
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
@@ -1036,12 +1039,17 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
     def _get_disagg_buffer_entries(self):
         """Return (buffer, uses_global_slots) entries in PD transfer order."""
-        host_pool = getattr(getattr(self, "sparse_kv_manager", None), "host_pool", None)
+        manager = getattr(self, "sparse_kv_manager", None)
+        host_pool = getattr(manager, "host_pool", None)
         if host_pool is not None:
             # Match native prefill's CKV layers, then KPE layers, then indexer.
-            entries = [
-                (buf, True) for component in host_pool.buffers for buf in component
-            ]
+            entries = []
+            if getattr(manager, "packed_c8", False):
+                entries = [(buffer, True) for buffer in manager.pd_main_buffers()]
+            else:
+                entries = [
+                    (buf, True) for component in host_pool.buffers for buf in component
+                ]
         else:
             self._raise_if_native_kv_cache_disabled()
             global_kv = self.is_draft_worker

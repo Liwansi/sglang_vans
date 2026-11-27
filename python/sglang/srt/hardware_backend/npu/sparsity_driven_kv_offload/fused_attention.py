@@ -47,6 +47,17 @@ def forward_fused_sparse_kv_offload(
     current_inputs = manager.offload_v2(
         k_nope, k_pe, layer, forward_batch, **offload_kwargs
     )
+    if (
+        getattr(manager, "packed_c8", False)
+        and layer.layer_id in manager.full_layer_to_slot
+    ):
+        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.c8_full_attention import (
+            forward_full_c8,
+        )
+
+        return forward_full_c8(
+            backend, q, q_rope, layer, forward_batch, topk_indices
+        )
     if not is_prefill:
         plan = backend.forward_metadata.sparse_kv_lim_plan
         rows = forward_batch.batch_size * plan.query_width

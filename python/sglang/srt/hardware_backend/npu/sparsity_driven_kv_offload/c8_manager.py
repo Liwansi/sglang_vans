@@ -14,6 +14,9 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_lim import
     LIMDecodeAdapter,
     sparse_query_width,
 )
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.layer_layout import (
+    SparseKVLayerLayout,
+)
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_manager import (
     FusedSparseKVCacheManager,
 )
@@ -313,11 +316,71 @@ class C8DecodeAdapter(LIMDecodeAdapter):
             query_width=width,
             hbm_row_offset=1,
         )
-        return self.finish(layer, batch, width)
+        # Preserve the raw Ordered result for the full HBM SFA.  The converted
+        # Copy-SFA source IDs have a different miss-first order.
+        return self.finish(layer, batch, width), source_ids
 
 
 class C8SparseKVCacheManager(FusedSparseKVCacheManager):
     packed_c8 = True
+
+    def __init__(self, req_to_token_pool, sparse_topk, *, paged_kv_cache):
+        self.layer_layout = SparseKVLayerLayout.build(
+            paged_kv_cache.start_layer,
+            paged_kv_cache.start_layer + paged_kv_cache.layer_num,
+            tuple(paged_kv_cache.indexer_layer_ids),
+        )
+        if not self.layer_layout.shared_layers:
+            raise ValueError("C8 HiSparse V2 requires at least one shared MLA layer")
+        budget = paged_kv_cache.sparse_kv_budget_plan
+        if (
+            budget.cache_layers != len(self.layer_layout.shared_layers)
+            or budget.plan_layers != len(self.layer_layout.full_layers)
+        ):
+            raise ValueError("C8 sparse layer budget does not match the KV pool")
+        super().__init__(
+            req_to_token_pool, sparse_topk, paged_kv_cache=paged_kv_cache
+        )
+        shared_buffers = self.device_kv_buffer
+        self.device_kv_buffer = [None] * self.layer_num
+        for layer_id, buffer in zip(
+            self.layer_layout.shared_layers, shared_buffers, strict=True
+        ):
+            self.device_kv_buffer[layer_id - self.start_layer] = buffer
+        # Same physical token IDs as the indexer K pool and PD prefill source.
+        self.full_layer_to_slot = {
+            layer_id: slot
+            for slot, layer_id in enumerate(self.layer_layout.full_layers)
+        }
+        self.full_hbm_kv_buffer = torch.empty(
+            (
+                len(self.full_layer_to_slot),
+                self.host_token_capacity // self.page_size,
+                self.page_size,
+                1,
+                C8_ROW_BYTES,
+            ),
+            dtype=torch.int8,
+            device=self.device,
+        )
+        # Graph padding addresses page zero.  Keep its data finite before the
+        # invalid query outputs are masked in the full-HBM attention path.
+        self.full_hbm_kv_buffer[:, 0].zero_()
+
+    def main_kv_buffer(self, layer_id):
+        slot = self.full_layer_to_slot.get(layer_id)
+        if slot is not None:
+            return self.full_hbm_kv_buffer[slot]
+        return self.host_kv_buffer[layer_id - self.start_layer]
+
+    def pd_main_buffers(self):
+        return self.layer_layout.transfer_main_buffers(
+            tuple(self.full_hbm_kv_buffer),
+            tuple(
+                self.host_kv_buffer[layer_id - self.start_layer]
+                for layer_id in self.layer_layout.shared_layers
+            ),
+        )
 
     @staticmethod
     def _load_copy_sfa_operator():
@@ -337,7 +400,7 @@ class C8SparseKVCacheManager(FusedSparseKVCacheManager):
     def _init_host_pool(self):
         self.host_pool = self.mf_host_pool = PackedMemFabricKVPool(
             tokens=self.host_token_capacity,
-            layers=self.layer_num,
+            layers=len(self.layer_layout.shared_layers),
             page_size=self.page_size,
             head_num=1,
             widths=(C8_ROW_BYTES,),
@@ -345,8 +408,15 @@ class C8SparseKVCacheManager(FusedSparseKVCacheManager):
             device=self.device,
             group=get_parallel().attn_tp_group,
         )
-        (self.host_kv_buffer,) = self.host_pool.buffers
-        self.dev_ptr_list = [x.data_ptr() for x in self.host_kv_buffer]
+        (shared_buffers,) = self.host_pool.buffers
+        self.host_kv_buffer = [None] * self.layer_num
+        self.dev_ptr_list = [0] * self.layer_num
+        for layer_id, buffer in zip(
+            self.layer_layout.shared_layers, shared_buffers, strict=True
+        ):
+            layer_index = layer_id - self.start_layer
+            self.host_kv_buffer[layer_index] = buffer
+            self.dev_ptr_list[layer_index] = buffer.data_ptr()
 
     def invalidate_packed_request(self, request_id):
         resident_id = (
@@ -387,9 +457,12 @@ class C8SparseKVCacheManager(FusedSparseKVCacheManager):
                 forward_batch, current.shape[0], current.device
             )
         src, dst, positions, valid = publication_rows
-        if self.host_pool.rank == 0:
-            _copy_packed(current, self.host_kv_buffer[layer_index], src, dst, valid)
-        self.host_pool.publish()
+        if layer.layer_id in self.full_layer_to_slot:
+            _copy_packed(current, self.main_kv_buffer(layer.layer_id), src, dst, valid)
+        else:
+            if self.host_pool.rank == 0:
+                _copy_packed(current, self.host_kv_buffer[layer_index], src, dst, valid)
+            self.host_pool.publish()
         if prefill:
             requests = forward_batch.req_pool_indices.long()
             self.resident_end[layer_index].index_fill_(0, requests, -1)
@@ -399,6 +472,9 @@ class C8SparseKVCacheManager(FusedSparseKVCacheManager):
 
     def copy_sfa_attention(self, layer, query_nope, query_rope, plan, current_inputs):
         layer_index = layer.layer_id - self.start_layer
+        owner_layer = self.layer_layout.group_for(layer.layer_id)[0]
+        if plan.owner_layer != owner_layer - self.start_layer:
+            raise RuntimeError("Copy-SFA received a plan from another indexer group")
         batch, width = plan.valid_rows.numel(), plan.query_width
         rows, heads = batch * width, query_nope.shape[1]
         padded_heads = self.budget.copy_sfa_query_heads

@@ -56,11 +56,25 @@ def move_packed_kv(manager, target, source):
         )
         rows = torch.arange(source.numel(), device=manager.device)
         valid = torch.ones_like(rows, dtype=torch.bool)
-        for layer, host in enumerate(manager.host_kv_buffer):
+        for layer in range(manager.layer_num):
+            layer_id = manager.start_layer + layer
+            host = manager.main_kv_buffer(layer_id)
             _copy_host_rows(manager, layer, host, scratch, source, rows, valid)
             _copy_host_rows(
                 manager, layer, scratch, host, rows, target, valid, to_host=True
             )
+    elif getattr(manager, "full_layer_to_slot", None):
+        # MF payload is shared across TP, but each TP rank owns its HBM rows.
+        rows = torch.arange(source.numel(), device=manager.device)
+        valid = torch.ones_like(rows, dtype=torch.bool)
+        scratch = torch.empty(
+            (source.numel(), 1, 656), dtype=torch.int8, device=manager.device
+        )
+        for layer_id in manager.full_layer_to_slot:
+            cache = manager.main_kv_buffer(layer_id)
+            layer = layer_id - manager.start_layer
+            _copy_host_rows(manager, layer, cache, scratch, source, rows, valid)
+            _copy_host_rows(manager, layer, scratch, cache, rows, target, valid)
     if mf is not None:
         mf.publish()
 
@@ -70,7 +84,9 @@ def snapshot_packed_kv(pool, indices):
     torch.npu.synchronize()
     manager = pool.sparse_kv_manager
     result = []
-    for layer, host in enumerate(manager.host_kv_buffer):
+    for layer in range(manager.layer_num):
+        layer_id = manager.start_layer + layer
+        host = manager.main_kv_buffer(layer_id)
         chunks = []
         states = _state_buffers(pool, layer)
         for start in range(0, len(indices), pool.cpu_offloading_chunk_size):
@@ -104,7 +120,9 @@ def restore_packed_kv(pool, snapshot, indices, request_id):
     torch.npu.synchronize()
     manager = pool.sparse_kv_manager
     mf = manager.mf_host_pool
-    for layer, host in enumerate(manager.host_kv_buffer):
+    for layer in range(manager.layer_num):
+        layer_id = manager.start_layer + layer
+        host = manager.main_kv_buffer(layer_id)
         states = _state_buffers(pool, layer)
         for start in range(0, len(indices), pool.cpu_offloading_chunk_size):
             selected = indices[start : start + pool.cpu_offloading_chunk_size].to(
@@ -113,7 +131,7 @@ def restore_packed_kv(pool, snapshot, indices, request_id):
             payload = snapshot[layer][start // pool.cpu_offloading_chunk_size]
             if len(payload) != len(states) + 1:
                 raise ValueError("A5 MF retraction snapshot component mismatch")
-            if mf is None or mf.rank == 0:
+            if not host.is_cpu or mf is None or mf.rank == 0:
                 rows = torch.arange(len(selected), device=pool.device)
                 _copy_host_rows(
                     manager,

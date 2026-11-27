@@ -347,6 +347,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     kvc.sparse_kv_budget_plan = get_sparse_kv_budget(
                         num_layers=num_layers,
                         kv_dtype=kvc.kv_cache_dtype,
+                        indexer_layer_ids=(
+                            kvc.get_dsa_indexer_layer_ids()
+                            if kvc.kv_cache_dtype == torch.float8_e4m3fn
+                            else None
+                        ),
                         **budget_options,
                     )
                 budget = kvc.sparse_kv_budget_plan

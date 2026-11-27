@@ -322,7 +322,7 @@ class DSANPUIndexerMixin:
                         "query_scale": query_scale,
                         "key_scale": pool.get_index_k_scale_buffer(layer_id),
                     }
-                plan = manager.lim_adapter.select(
+                selection = manager.lim_adapter.select(
                     manager,
                     query=query,
                     weights=weights,
@@ -332,8 +332,12 @@ class DSANPUIndexerMixin:
                     layer_id=layer_id,
                     **scales,
                 )
-                backend.forward_metadata.sparse_kv_lim_plan = plan
-                return plan.source_ids
+                if getattr(manager, "packed_c8", False):
+                    plan, ordered_topk = selection
+                    backend.forward_metadata.sparse_kv_lim_plan = plan
+                    return ordered_topk
+                backend.forward_metadata.sparse_kv_lim_plan = selection
+                return selection.source_ids
 
             if use_quant_indexer:
                 query, query_scale = _quantize_npu_indexer_activation(
