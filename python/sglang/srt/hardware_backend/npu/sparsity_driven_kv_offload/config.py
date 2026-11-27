@@ -173,8 +173,8 @@ def get_sparsity_driven_kv_offload_cell_size(
             num_indexer_layers = num_layers
     cell_size = index_head_dim * element_size * num_indexer_layers
     if use_fused_sparse_kv_offload() and element_size == 1:
-        # C8 full/indexer layers retain the entire packed MLA row in HBM.
-        # The shared layers continue to use the bounded Copy-SFA cache.
+        # C8 full/indexer layers retain the entire packed MLA row in the
+        # native HBM pool. Shared layers use a bounded resident cache.
         from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_budget import (
             C8_ROW_BYTES,
         )

@@ -717,6 +717,17 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.indexer_layer_id_to_slot = {
             layer_id: slot for slot, layer_id in enumerate(self.indexer_layer_ids)
         }
+        self.full_mla_layer_ids = (
+            self.indexer_layer_ids
+            if self.enable_sparsity_driven_kv_offload
+            and envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get()
+            and dtype == torch.float8_e4m3fn
+            and kv_cache_dim == 656
+            else ()
+        )
+        self.full_mla_layer_id_to_slot = {
+            layer_id: slot for slot, layer_id in enumerate(self.full_mla_layer_ids)
+        }
         assert len(self.indexer_layer_id_to_slot) == self.num_indexer_layers
         assert all(
             self.start_layer <= i < self.start_layer + self.layer_num
@@ -751,6 +762,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.dcp_size = parallel.attn_dcp_size
         self.dcp_rank = parallel.attn_dcp_rank
         self.use_combined_kv_buffer = use_combined_kv_buffer
+        if self.full_mla_layer_ids and use_combined_kv_buffer:
+            raise ValueError("Packed sparse MLA full layers require split K/V buffers")
         global_page_padding = self.dcp_size if self.dcp_size > 1 else 1
         kv_page_padding = global_page_padding if is_draft_worker else 1
         index_page_padding = global_page_padding if index_head_dim is not None else 1
@@ -764,7 +777,21 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
-            if self.enable_sparsity_driven_kv_offload:
+            if self.full_mla_layer_ids:
+                full_layers = len(self.full_mla_layer_ids)
+                full_pages = self.size // self.page_size + self.kv_page_padding
+                self.k_buffer = torch.zeros(
+                    (full_layers, full_pages, self.page_size, 1, self.kv_cache_dim),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
+                # Packed C8 stores RoPE and scales in K; V has zero width.
+                self.v_buffer = torch.empty(
+                    (full_layers, full_pages, self.page_size, 1, 0),
+                    dtype=torch.bfloat16,
+                    device=self.device,
+                )
+            elif self.enable_sparsity_driven_kv_offload:
                 self.k_buffer = None
                 self.v_buffer = None
             elif self.use_combined_kv_buffer:
@@ -856,7 +883,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 None if self.use_combined_kv_buffer else self._mla_native_buffers
             ),
             data_ptrs=None,
-            layer_indices=tuple(range(self.layer_num)),
+            layer_indices=(
+                tuple(i - self.start_layer for i in self.full_mla_layer_ids)
+                if self.full_mla_layer_ids
+                else tuple(range(self.layer_num))
+            ),
             device_layer_num=self.layer_num,
             page_size=self.page_size,
             kv_lora_rank=self.kv_lora_rank,
@@ -913,10 +944,17 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 kv_size_bytes += get_tensor_size_bytes(index_k_cache)
         if self.index_k_scale_buffer is not None:
             kv_size_bytes += get_tensor_size_bytes(self.index_k_scale_buffer)
-        manager = getattr(self, "sparse_kv_manager", None)
-        if getattr(manager, "packed_c8", False):
-            kv_size_bytes += get_tensor_size_bytes(manager.full_hbm_kv_buffer)
         return kv_size_bytes
+
+    def _mla_kv_slot(self, layer_id: int) -> int:
+        if self.full_mla_layer_ids:
+            try:
+                return self.full_mla_layer_id_to_slot[layer_id]
+            except KeyError as e:
+                raise ValueError(
+                    f"MLA KV for shared layer {layer_id} is stored in the sparse Host pool"
+                ) from e
+        return layer_id - self.start_layer
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         """Mirror accepted-token moves only for the packed Ascend950 pool."""
@@ -965,9 +1003,10 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         self._raise_if_native_kv_cache_disabled()
+        slot = self._mla_kv_slot(layer_id)
         return (
-            self.k_buffer[layer_id - self.start_layer],
-            self.v_buffer[layer_id - self.start_layer],
+            self.k_buffer[slot],
+            self.v_buffer[slot],
         )
 
     def get_combined_kv_buffer(self, layer_id: int):
@@ -996,19 +1035,21 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         self._raise_if_native_kv_cache_disabled()
+        slot = self._mla_kv_slot(layer_id)
 
         if self.store_dtype != self.dtype:
-            return self.k_buffer[layer_id - self.start_layer].view(self.dtype)
-        return self.k_buffer[layer_id - self.start_layer]
+            return self.k_buffer[slot].view(self.dtype)
+        return self.k_buffer[slot]
 
     def get_value_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         self._raise_if_native_kv_cache_disabled()
+        slot = self._mla_kv_slot(layer_id)
 
         if self.store_dtype != self.dtype:
-            return self.v_buffer[layer_id - self.start_layer].view(self.dtype)
-        return self.v_buffer[layer_id - self.start_layer]
+            return self.v_buffer[slot].view(self.dtype)
+        return self.v_buffer[slot]
 
     def get_index_k_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
@@ -1128,6 +1169,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         loc, _, _ = unwrap_write_loc(loc_info)
         self._raise_if_native_kv_cache_disabled()
         layer_id = layer.layer_id
+        slot = self._mla_kv_slot(layer_id)
         if self.dsa_kv_cache_store_fp8:
             if cache_v is None:
                 cache_k, cache_v = cache_k.split(
@@ -1135,7 +1177,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 )
             packed = self._pack_dsa_fp8_kv_cache(cache_k, cache_v)
             torch_npu.npu_scatter_nd_update_(
-                self.k_buffer[layer_id - self.start_layer].view(
+                self.k_buffer[slot].view(
                     -1, 1, self.kv_cache_dim
                 ),
                 loc.view(-1, 1),

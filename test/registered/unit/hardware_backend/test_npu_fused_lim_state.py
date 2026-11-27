@@ -119,9 +119,11 @@ class TestLIMState(CustomTestCase):
         self.assertEqual(plan.request_rows, 9)
         self.assertEqual(plan.manager_buffers["request_to_resident"].shape, (9,))
         self.assertEqual(
-            plan.manager_buffers["device_kv_buffer"].shape, (2, 8192, 1, 656)
+            plan.manager_buffers["device_kv_buffer"].shape, (2, 8320, 1, 656)
         )
-        self.assertEqual(plan.device_kv_bytes, 2 * 8192 * 656 * options["num_layers"])
+        self.assertEqual(plan.device_kv_bytes, 2 * 8320 * 656 * options["num_layers"])
+        self.assertEqual(plan.manager_buffers["planner_hbm_block_table"].shape, (8, 65))
+        self.assertEqual(plan.sparse_copy_descriptor_bytes, 8 * 4 * 2048 * 24 + 4)
         self.assertNotIn("device_rope_buffer", plan.manager_buffers)
         key = torch.empty((5, 128, 1, 128), dtype=torch.float8_e4m3fn)
         plan.bind_native_pool(

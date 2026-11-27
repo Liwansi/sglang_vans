@@ -1,5 +1,6 @@
 """Ascend950 packed payload, ordered indexer and sparse KV plan adapters."""
 
+from dataclasses import dataclass
 from importlib import import_module
 
 import torch
@@ -23,11 +24,8 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_manager im
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.memfabric_pool import (
     MemFabricKVPool,
 )
-from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.npu_lim_copy_sfa_metadata import (
-    prepare_copy_sfa_metadata,
-)
-from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.npu_plan_copy_sfa_metadata import (
-    plan_to_copy_sfa,
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.npu_plan_sparse_copy_metadata import (
+    prepare_plan_sparse_copy_metadata,
 )
 from sglang.srt.runtime_context import get_parallel
 
@@ -54,8 +52,22 @@ class PackedMemFabricKVPool(MemFabricKVPool):
             _copy_packed(source, destination, source_rows, destination_rows, valid)
 
 
+@dataclass
+class C8PlanSelection:
+    miss_tokens: torch.Tensor
+    miss_slots: torch.Tensor
+    miss_counts: torch.Tensor
+    request_slots: torch.Tensor
+    resident_slots: torch.Tensor
+    valid_rows: torch.Tensor
+    sparse_indices: torch.Tensor
+    sfa_block_table: torch.Tensor
+    query_width: int
+    owner_layer: int
+
+
 class C8DecodeAdapter(LIMDecodeAdapter):
-    """Convert the ordered indexer/Plan outputs to the existing Copy-SFA ABI."""
+    """Retain Ordered/Plan slots and misses for shared-layer sparse copies."""
 
     def __init__(self, manager):
         super().__init__(manager)
@@ -165,8 +177,8 @@ class C8DecodeAdapter(LIMDecodeAdapter):
                 "The C8 resident KV allocation is smaller than SparseKvPlan requires"
             )
         # A max-width-4 pool has 8192 physical slots, but decode and width-2
-        # Plan runs manage only the first 4096. Keep Copy-SFA's per-request
-        # cache size and sparse/short decision consistent with that Plan run.
+        # Plan runs manage only the first 4096. Keep the sparse/short decision
+        # consistent with the active Plan capacity.
         sparse = self._pre_valid[:batch] & (self._pre_lengths[:batch] >= capacity)
         self._pre_sparse[:batch].copy_(sparse)
         self._pre_cache_sizes[:batch].copy_(
@@ -285,40 +297,45 @@ class C8DecodeAdapter(LIMDecodeAdapter):
         self.last_plan_modes = modes
         for destination, value in zip(persistent, (last_ids, slots, lru, modes)):
             destination.index_copy_(0, state_rows, value)
-        (
-            sorted_sources,
-            sorted_slots,
-            topk_misses,
-            misses,
-            miss_destinations,
-            miss_counts,
-        ) = plan_to_copy_sfa(
-            source_ids, current_slots, miss_count, miss_tokens, miss_slots, width
+        self.last_prefix[layer].index_copy_(
+            0, self.resident_safe_slots[:batch].long(), self._pre_next_prefix[:batch]
         )
-        self.source_ids[:rows].copy_(sorted_sources)
-        self.device_slots[:rows].copy_(sorted_slots)
-        self.topk_misses[:rows].copy_(topk_misses)
-        self.miss_sources[:batch].fill_(-1)
-        self.miss_slots[:batch].fill_(-1)
-        self.miss_sources[:batch, : width * manager.sparse_topk].copy_(misses)
-        self.miss_slots[:batch, : width * manager.sparse_topk].copy_(
-            miss_destinations
+        # Shared layers consume the same Plan. Prepare their SFA view once.
+        pages_per_row = manager.cache_capacity // manager.page_size + 1
+        sfa_block_table = manager.planner_hbm_block_table[:batch]
+        pages = torch.arange(pages_per_row, dtype=torch.int32, device=query.device)
+        resident = torch.where(
+            self._pre_valid[:batch], self.resident_safe_slots[:batch] - 1, 0
+        ).to(torch.int32)
+        sfa_block_table.copy_(
+            resident[:, None] * pages_per_row + pages[None, :]
         )
-        self.miss_counts[:batch].copy_(miss_counts)
-        prepare_copy_sfa_metadata(
-            source_ids=self.source_ids[:rows],
-            valid_rows=self._pre_valid[:batch],
-            sparse_rows=self._pre_sparse[:batch],
-            request_slots=self.resident_safe_slots[:batch],
-            actual_seq_lengths_kv=self._pre_lengths[:batch],
-            hbm_block_table=manager.planner_hbm_block_table[:batch],
-            capacity=capacity,
-            query_width=width,
-            hbm_row_offset=1,
+        valid_query = self._pre_valid[:batch].repeat_interleave(width)[:, None]
+        sentinel = torch.iinfo(torch.int32).max
+        sparse_indices = torch.where(
+            valid_query & (current_slots >= 0), current_slots, sentinel
+        ).sort(dim=-1).values
+        sparse_indices = torch.where(sparse_indices == sentinel, -1, sparse_indices)
+        sparse_indices = torch.where(
+            valid_query, sparse_indices, torch.zeros_like(sparse_indices)
         )
-        # Preserve the raw Ordered result for the full HBM SFA.  The converted
-        # Copy-SFA source IDs have a different miss-first order.
-        return self.finish(layer, batch, width), source_ids
+        # Keep the Plan outputs in their original order. The miss descriptors
+        # serve each shared layer; the full layer consumes Ordered directly.
+        return (
+            C8PlanSelection(
+                miss_tokens=miss_tokens,
+                miss_slots=miss_slots,
+                miss_counts=miss_count,
+                request_slots=self.request_safe_slots[:batch],
+                resident_slots=self.resident_safe_slots[:batch],
+                valid_rows=self._pre_valid[:batch],
+                sparse_indices=sparse_indices,
+                sfa_block_table=sfa_block_table,
+                query_width=width,
+                owner_layer=layer,
+            ),
+            source_ids,
+        )
 
 
 class C8SparseKVCacheManager(FusedSparseKVCacheManager):
@@ -342,6 +359,9 @@ class C8SparseKVCacheManager(FusedSparseKVCacheManager):
             req_to_token_pool, sparse_topk, paged_kv_cache=paged_kv_cache
         )
         shared_buffers = self.device_kv_buffer
+        for buffer in shared_buffers:
+            buffer[:, : self.page_size].zero_()
+            buffer[:, -self.page_size :].zero_()
         self.device_kv_buffer = [None] * self.layer_num
         for layer_id, buffer in zip(
             self.layer_layout.shared_layers, shared_buffers, strict=True
@@ -352,30 +372,28 @@ class C8SparseKVCacheManager(FusedSparseKVCacheManager):
             layer_id: slot
             for slot, layer_id in enumerate(self.layer_layout.full_layers)
         }
-        self.full_hbm_kv_buffer = torch.empty(
-            (
-                len(self.full_layer_to_slot),
-                self.host_token_capacity // self.page_size,
-                self.page_size,
-                1,
-                C8_ROW_BYTES,
-            ),
-            dtype=torch.int8,
-            device=self.device,
+        if tuple(paged_kv_cache.full_mla_layer_ids) != self.layer_layout.full_layers:
+            raise ValueError("Native MLA full-layer allocation disagrees with C8 layout")
+        max_descriptors = self.batch_capacity * self.max_query_width * self.sparse_topk
+        self.sparse_copy_sources = torch.empty(
+            (max_descriptors,), dtype=torch.int64, device=self.device
         )
-        # Graph padding addresses page zero.  Keep its data finite before the
-        # invalid query outputs are masked in the full-HBM attention path.
-        self.full_hbm_kv_buffer[:, 0].zero_()
+        self.sparse_copy_destinations = torch.empty_like(self.sparse_copy_sources)
+        self.sparse_copy_lengths = torch.empty_like(self.sparse_copy_sources)
+        self.sparse_copy_count = torch.zeros(1, dtype=torch.int32, device=self.device)
 
     def main_kv_buffer(self, layer_id):
-        slot = self.full_layer_to_slot.get(layer_id)
-        if slot is not None:
-            return self.full_hbm_kv_buffer[slot]
+        if layer_id in self.full_layer_to_slot:
+            slot = self.paged_kv_cache.full_mla_layer_id_to_slot[layer_id]
+            return self.paged_kv_cache.k_buffer[slot].view(torch.int8)
         return self.host_kv_buffer[layer_id - self.start_layer]
 
     def pd_main_buffers(self):
         return self.layer_layout.transfer_main_buffers(
-            tuple(self.full_hbm_kv_buffer),
+            tuple(
+                self.main_kv_buffer(layer_id)
+                for layer_id in self.layer_layout.full_layers
+            ),
             tuple(
                 self.host_kv_buffer[layer_id - self.start_layer]
                 for layer_id in self.layer_layout.shared_layers
@@ -384,15 +402,8 @@ class C8SparseKVCacheManager(FusedSparseKVCacheManager):
 
     @staticmethod
     def _load_copy_sfa_operator():
-        if not (
-            hasattr(torch.ops.npu, "a5_copy_sfa_capabilities")
-            and torch.ops.npu.a5_copy_sfa_capabilities().get("resident_source_gather")
-            == 1
-        ):
-            raise RuntimeError(
-                "A5 C8 requires the paired native-LIM source-gather CopySFA wheel."
-            )
-        return torch.ops.npu.fused_quant_scatter_copy_sparse_flash_attention_v2
+        # Packed C8 uses MemFabric sparse_copy followed by the Ascend SFA path.
+        return None
 
     def _make_decode_adapter(self):
         return C8DecodeAdapter(self)
@@ -458,11 +469,10 @@ class C8SparseKVCacheManager(FusedSparseKVCacheManager):
             )
         src, dst, positions, valid = publication_rows
         if layer.layer_id in self.full_layer_to_slot:
-            _copy_packed(current, self.main_kv_buffer(layer.layer_id), src, dst, valid)
-        else:
-            if self.host_pool.rank == 0:
-                _copy_packed(current, self.host_kv_buffer[layer_index], src, dst, valid)
-            self.host_pool.publish()
+            raise RuntimeError("Full C8 layers must write through the native MLA pool")
+        if self.host_pool.rank == 0:
+            _copy_packed(current, self.host_kv_buffer[layer_index], src, dst, valid)
+        self.host_pool.publish()
         if prefill:
             requests = forward_batch.req_pool_indices.long()
             self.resident_end[layer_index].index_fill_(0, requests, -1)
@@ -470,51 +480,42 @@ class C8SparseKVCacheManager(FusedSparseKVCacheManager):
                 self.lim_adapter.reset_layer_requests(layer_index, requests)
         return current, positions, valid
 
-    def copy_sfa_attention(self, layer, query_nope, query_rope, plan, current_inputs):
+    def copy_shared_kv(self, layer, plan):
         layer_index = layer.layer_id - self.start_layer
         owner_layer = self.layer_layout.group_for(layer.layer_id)[0]
         if plan.owner_layer != owner_layer - self.start_layer:
-            raise RuntimeError("Copy-SFA received a plan from another indexer group")
+            raise RuntimeError("Shared SFA received a plan from another indexer group")
         batch, width = plan.valid_rows.numel(), plan.query_width
-        rows, heads = batch * width, query_nope.shape[1]
-        padded_heads = self.budget.copy_sfa_query_heads
-        lengths = self.lim_adapter._pre_lengths[:batch]
-        current, positions, valid = current_inputs
-        hbm_table = self.planner_hbm_block_table[:batch]
-        if heads < padded_heads:
-            padding = (0, 0, 0, padded_heads - heads)
-            query_nope = torch.nn.functional.pad(query_nope, padding)
-            query_rope = torch.nn.functional.pad(query_rope, padding)
-        output = query_nope.new_empty((rows, padded_heads, 512))
-        self._copy_sfa_operator(
-            query_nope.contiguous(),
-            query_rope.contiguous(),
-            self.device_kv_buffer[layer_index].view(
-                -1, self.page_size, 1, C8_ROW_BYTES
-            ),
-            self.host_kv_buffer[layer_index],
-            self.dev_ptr_list[layer_index],
-            hbm_table,
-            self.lim_adapter.block_table[:batch],
-            plan.device_slots.unsqueeze(1),
-            plan.source_ids.unsqueeze(1),
-            plan.topk_misses,
-            self.lim_adapter.query_ends[width - 1, :batch],
-            lengths,
-            self.lim_adapter._pre_cache_sizes[:batch],
-            plan.miss_sources,
-            plan.miss_slots,
-            plan.miss_counts,
-            layer.scaling,
-            output,
-            current=current[:rows],
-            positions=positions[:rows],
-            current_valid=valid[:rows],
-            request_slots=plan.request_safe_slots,
+        rows = batch * width
+        cache = self.device_kv_buffer[layer_index]
+        count_capacity = rows * self.sparse_topk
+        prepare_plan_sparse_copy_metadata(
+            miss_tokens=plan.miss_tokens,
+            miss_slots=plan.miss_slots,
+            miss_counts=plan.miss_counts,
+            request_slots=plan.request_slots,
+            resident_slots=plan.resident_slots,
+            valid_rows=plan.valid_rows,
             req_to_token=self.req_to_token_pool.req_to_token,
-            resident_end=self.resident_end[layer_index, : self.actual_request_rows],
-            native_lim_plan=True,
+            sources=self.sparse_copy_sources[:count_capacity],
+            destinations=self.sparse_copy_destinations[:count_capacity],
+            lengths=self.sparse_copy_lengths[:count_capacity],
+            count=self.sparse_copy_count,
+            host_base=self.host_kv_buffer[layer_index].data_ptr(),
+            device_base=cache.data_ptr(),
+            query_width=width,
+            cache_stride=self.cache_capacity + self.page_size,
+            cache_capacity=self.cache_capacity,
+            host_capacity=self.host_token_capacity,
+            row_bytes=C8_ROW_BYTES,
         )
-        # Invalid requests have positive TND query width and zero KV length.
-        # CopySFA initializes their output before skipping them in attention.
-        return output[:, :heads].reshape(rows, -1)
+        result = self.host_pool.offload.sparse_copy(
+            self.sparse_copy_sources[:count_capacity],
+            self.sparse_copy_destinations[:count_capacity],
+            self.sparse_copy_lengths[:count_capacity],
+            self.sparse_copy_count,
+            cache.device,
+        )
+        if result not in (None, 0):
+            raise RuntimeError(f"Sparse KV MemFabric sparse_copy failed: {result}")
+        return cache

@@ -105,14 +105,19 @@ class BudgetPlan:
             "resident_begin": BufferSpec((num_layers, request_rows), metadata_dtype),
             "resident_end": BufferSpec((num_layers, request_rows), metadata_dtype),
             "planner_hbm_block_table": BufferSpec(
-                (batch_capacity, cache_tokens // page_size), metadata_dtype
+                (
+                    batch_capacity,
+                    cache_tokens // page_size + (1 if packed_c8 else 0),
+                ),
+                metadata_dtype,
             ),
         }
         if packed_c8:
             if resident_rows <= 1:
                 raise ValueError("A5 C8 requires at least one live resident row.")
             self.manager_buffers["device_kv_buffer"] = BufferSpec(
-                (resident_rows - 1, cache_tokens, 1, C8_ROW_BYTES),
+                # The extra page backs SFA's C + query_width - 1 virtual tail.
+                (resident_rows - 1, cache_tokens + page_size, 1, C8_ROW_BYTES),
                 torch.int8,
                 self.cache_layers,
             )
@@ -186,7 +191,12 @@ class BudgetPlan:
         self.adapter_bytes = sum(s.nbytes for s in self.adapter_buffers.values())
         self.plan_state_bytes = 0
         self.plan_scratch_bytes = 0
+        self.sparse_copy_descriptor_bytes = 0
         if packed_c8:
+            self.sparse_copy_descriptor_bytes = (
+                batch_capacity * max_query_width * top_k * 3 * torch.int64.itemsize
+                + torch.int32.itemsize
+            )
             # Each supported query width owns a persistent Plan cache.  Decode
             # width 1 can alternate with the configured MTP verify width.
             state_rows = resident_rows + batch_capacity
@@ -199,8 +209,8 @@ class BudgetPlan:
                     * width
                     * (8 + 2 * plan_capacity * 4 + 4)
                 )
-            # State gather/scatter plus the Plan outputs and miss-first
-            # conversion coexist for one forward on the device.
+            # State gather/scatter, Plan outputs and SFA slot sorting coexist
+            # for one forward on the device.
             self.plan_scratch_bytes = (
                 batch_capacity
                 * max_query_width
@@ -220,6 +230,7 @@ class BudgetPlan:
             + self.adapter_bytes
             + self.plan_state_bytes
             + self.plan_scratch_bytes
+            + self.sparse_copy_descriptor_bytes
             + (
                 self.plan_layers * self.page_size * C8_ROW_BYTES
                 if self.packed_c8

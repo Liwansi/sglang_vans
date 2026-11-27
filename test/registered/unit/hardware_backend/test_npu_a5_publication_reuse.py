@@ -57,6 +57,7 @@ def test_publication_rows_are_built_once_per_target_forward():
     manager = SimpleNamespace(
         packed_c8=True,
         start_layer=0,
+        full_layer_to_slot={0: 0},
         prepare_publication_rows=Mock(return_value=publication_rows),
         offload_v2=Mock(
             return_value=(
@@ -65,7 +66,7 @@ def test_publication_rows_are_built_once_per_target_forward():
                 torch.ones(2, dtype=torch.bool),
             )
         ),
-        copy_sfa_attention=Mock(return_value=torch.empty(2, 512)),
+        copy_shared_kv=Mock(return_value=torch.empty(2, 4224, 1, 656)),
     )
     backend = SimpleNamespace(
         sparse_kv_manager=manager,
@@ -87,29 +88,38 @@ def test_publication_rows_are_built_once_per_target_forward():
         "k_rope": torch.empty(2, 1, 64),
     }
 
-    for layer_id in (0, 1):
+    attention = ModuleType("c8_full_attention")
+    attention.forward_full_c8 = Mock(return_value=torch.empty(2, 512))
+    attention.forward_shared_c8 = Mock(return_value=torch.empty(2, 512))
+    attention_name = (
+        "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload."
+        "c8_full_attention"
+    )
+    with patch.dict(sys.modules, {attention_name: attention}):
+        for layer_id in (0, 1):
+            module.forward_fused_sparse_kv_offload(
+                backend,
+                layer=SimpleNamespace(layer_id=layer_id, tp_k_head_num=1),
+                forward_batch=forward_batch,
+                **tensors,
+            )
+
+        # Capture warmup may execute again with the same graph ForwardMetadata.
+        # Its first layer must still record a fresh producer in that invocation.
         module.forward_fused_sparse_kv_offload(
             backend,
-            layer=SimpleNamespace(layer_id=layer_id, tp_k_head_num=1),
+            layer=SimpleNamespace(layer_id=0, tp_k_head_num=1),
             forward_batch=forward_batch,
             **tensors,
         )
 
-    manager.prepare_publication_rows.assert_called_once()
+    assert manager.prepare_publication_rows.call_count == 2
     assert metadata.sparse_kv_publication_rows is publication_rows
-    assert manager.offload_v2.call_count == 2
+    assert manager.offload_v2.call_count == 1
     for call in manager.offload_v2.call_args_list:
         assert call.kwargs["publication_rows"] is publication_rows
-
-    # Capture warmup may execute again with the same graph ForwardMetadata.
-    # Its first layer must still record a fresh producer in that invocation.
-    module.forward_fused_sparse_kv_offload(
-        backend,
-        layer=SimpleNamespace(layer_id=0, tp_k_head_num=1),
-        forward_batch=forward_batch,
-        **tensors,
-    )
-    assert manager.prepare_publication_rows.call_count == 2
+    assert attention.forward_full_c8.call_count == 2
+    attention.forward_shared_c8.assert_called_once()
 
 
 if __name__ == "__main__":

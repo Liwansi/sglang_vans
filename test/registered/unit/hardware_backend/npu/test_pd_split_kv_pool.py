@@ -36,6 +36,19 @@ def _make_pool():
 
 
 class TestPDSplitKVPool(CustomTestCase):
+    def test_compact_full_mla_slots_keep_model_layer_ids(self):
+        pool = NPUMLATokenToKVPool.__new__(NPUMLATokenToKVPool)
+        pool.start_layer = 0
+        pool.layer_transfer_counter = None
+        pool.full_mla_layer_ids = (0, 4)
+        pool.full_mla_layer_id_to_slot = {0: 0, 4: 1}
+        pool.k_buffer = torch.zeros((2, 1, 128, 1, 656), dtype=torch.uint8)
+        pool.v_buffer = torch.empty((2, 1, 128, 1, 0), dtype=torch.bfloat16)
+
+        self.assertEqual(pool.get_kv_buffer(4)[0].data_ptr(), pool.k_buffer[1].data_ptr())
+        with self.assertRaisesRegex(ValueError, "shared layer 1"):
+            pool.get_kv_buffer(1)
+
     def test_pool_allocation_follows_fused_role(self):
         from sglang.srt.environ import envs
 

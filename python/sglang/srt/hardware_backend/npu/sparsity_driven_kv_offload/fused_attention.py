@@ -31,6 +31,23 @@ def forward_fused_sparse_kv_offload(
     is_prefill = forward_batch.forward_mode.is_extend_without_speculative()
     k_nope = k.view(-1, layer.tp_k_head_num, backend.kv_lora_rank).contiguous()
     k_pe = k_rope.view(-1, layer.tp_k_head_num, backend.qk_rope_head_dim).contiguous()
+    if (
+        getattr(manager, "packed_c8", False)
+        and layer.layer_id in manager.full_layer_to_slot
+    ):
+        if not is_prefill and layer.layer_id == manager.start_layer:
+            backend.forward_metadata.sparse_kv_publication_rows = (
+                manager.prepare_publication_rows(
+                    forward_batch, k_nope.shape[0], k_nope.device
+                )
+            )
+        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.c8_full_attention import (
+            forward_full_c8,
+        )
+
+        return forward_full_c8(
+            backend, q, k_nope, q_rope, k_pe, layer, forward_batch, topk_indices
+        )
     offload_kwargs = {}
     if not is_prefill and getattr(manager, "packed_c8", False):
         metadata = backend.forward_metadata
@@ -47,27 +64,24 @@ def forward_fused_sparse_kv_offload(
     current_inputs = manager.offload_v2(
         k_nope, k_pe, layer, forward_batch, **offload_kwargs
     )
-    if (
-        getattr(manager, "packed_c8", False)
-        and layer.layer_id in manager.full_layer_to_slot
-    ):
-        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.c8_full_attention import (
-            forward_full_c8,
-        )
-
-        return forward_full_c8(
-            backend, q, q_rope, layer, forward_batch, topk_indices
-        )
     if not is_prefill:
         plan = backend.forward_metadata.sparse_kv_lim_plan
         rows = forward_batch.batch_size * plan.query_width
-        result = manager.copy_sfa_attention(
-            layer,
-            q[:rows].view(rows, -1, backend.kv_lora_rank),
-            q_rope[:rows].view(rows, -1, backend.qk_rope_head_dim),
-            plan,
-            current_inputs,
-        )
+        query_nope = q[:rows].view(rows, -1, backend.kv_lora_rank)
+        query_rope = q_rope[:rows].view(rows, -1, backend.qk_rope_head_dim)
+        if getattr(manager, "packed_c8", False):
+            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.c8_full_attention import (
+                forward_shared_c8,
+            )
+
+            cache = manager.copy_shared_kv(layer, plan)
+            result = forward_shared_c8(
+                backend, query_nope, query_rope, layer, plan, cache
+            )
+        else:
+            result = manager.copy_sfa_attention(
+                layer, query_nope, query_rope, plan, current_inputs
+            )
         if q.shape[0] > rows:
             return torch.nn.functional.pad(result, (0, 0, 0, q.shape[0] - rows))
         return result
